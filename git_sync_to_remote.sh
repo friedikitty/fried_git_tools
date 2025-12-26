@@ -69,7 +69,7 @@ fi
 
 # Parameters
 WORKSPACE_DIR="$1"
-REMOTE="${2:-origin}"  # Default to 'origin' if not provided
+REMOTE="${2:-destination}"  # Default to 'origin' if not provided
 BRANCH="${3:-develop}"      # Default to '5.4' if not provided
 
 # Configuration
@@ -94,6 +94,19 @@ cd "$WORKSPACE_DIR" || exit 1
 echo "Using remote: $REMOTE"
 echo "Using branch: $BRANCH"
 
+# Check if remote is 'origin' and ask for confirmation
+if [ "$REMOTE" = "origin" ]; then
+    echo ""
+    echo "WARNING: Push to origin, which seems dangerous!"
+    echo "    Git sync usually syncs to a second remote."
+    read -p "Are you sure? [yes/no]: " confirmation
+    if [ "$confirmation" != "yes" ]; then
+        echo "Operation cancelled."
+        exit 0
+    fi
+    echo ""
+fi
+
 # Get remote URL
 REMOTE_URL=$(git remote get-url $REMOTE)
 if [ $? -ne 0 ]; then
@@ -107,13 +120,17 @@ echo "Remote URL: $REMOTE_URL"
 echo "Fetching latest remote state..."
 git fetch --force $REMOTE
 
+#  You have to make sure the remote branch is already create, it may point to nothing
+# Then we try to compare the heads/branch to target remote's branch, then get the range to commit
+
 # check if the branch exists on the remote
 if git show-ref --quiet --verify refs/remotes/$REMOTE/$BRANCH; then
     # if so, only push the commits that are not on the remote already
-    range=$REMOTE/$BRANCH..HEAD
+    range=$REMOTE/$BRANCH..refs/heads/$BRANCH;
 else
-    # else push all the commits
-    range=HEAD
+    # else error
+	echo "Error: Branch '$BRANCH' not found on remote '$REMOTE'"
+	exit 1
 fi
 
 echo "range: $range"

@@ -5,26 +5,29 @@
 ###############################################################################
 #
 # DESCRIPTION:
-#   This script pushes git commits in batches to avoid server limits,
-#   such as pack size limits or timeout issues when pushing many commits.
+#   This script syncs git commits from origin remote to destination remote in batches
+#   to avoid server limits, such as pack size limits or timeout issues when pushing many commits.
 #
 # USAGE:
-#   ./git_sync_to_remote.sh <workspace_directory> [remote] [branch]
+#   ./git_sync_to_remote.sh <workspace_directory> [remote] [branch] [--debug]
 #
 # PARAMETERS:
 #   workspace_directory (required) - Path to the git repository
-#   remote (optional)              - Remote name 
-#   branch (optional)              - Target branch name
+#   remote (optional)              - Destination remote name (default: destination)
+#   branch (optional)              - Branch name to sync (default: develop)
+#   --debug (optional)             - Enable debug mode (list commits per batch and require confirmation before each batch)
+#
+# NOTE: Source remote is always 'origin'. Script syncs: origin -> destination
 #
 # EXAMPLES:
-#   # Push to default remote and branch
+#   # Sync from origin to default destination remote (destination) and branch (develop)
 #   ./git_sync_to_remote.sh /path/to/repo
 #
-#   # Push to specific remote and branch
-#   ./git_sync_to_remote.sh /path/to/repo origin develop
+#   # Sync from origin to specific destination remote and branch
+#   ./git_sync_to_remote.sh /path/to/repo destination 2025.1-lts
 #
-#   # Push to custom remote with default branch
-#   ./git_sync_to_remote.sh /path/to/repo upstream
+#   # Sync with debug mode enabled
+#   ./git_sync_to_remote.sh /path/to/repo destination 2025.1-lts --debug
 #
 # CONFIGURATION:
 #   BATCH_SIZE  - Number of commits per batch (default: 50)
@@ -32,10 +35,10 @@
 #
 # HOW IT WORKS:
 #   1. Check if the workspace is a valid git repository
-#   2. Fetch the latest state from remote repository
-#   3. Find commits that need to be pushed (local only)
+#   2. Fetch the latest state from both origin and destination remotes
+#   3. Find commits in origin that are not in destination (origin..destination)
 #   4. Split commits into batches of BATCH_SIZE
-#   5. Push each batch one by one to the remote branch
+#   5. Push each batch from origin to destination remote in chronological order
 #   6. Use --force-with-lease for safe force pushing (if enabled)
 #
 # FORCE PUSH BEHAVIOR:
@@ -62,17 +65,34 @@
 
 # Check if required parameters are provided
 if [ $# -lt 1 ]; then
-    echo "Usage: $0 <workspace_directory> [remote] [branch]"
-    echo "Example: $0 /path/to/repo  origin develop"
+    echo "Usage: $0 <workspace_directory> [destination_remote] [branch] [--debug]"
+    echo "Note: Always syncs from 'origin' remote to destination remote"
+    echo ""
+    echo "Examples:"
+    echo "  $0 /path/to/repo destination 2025.1-lts"
+    echo "  $0 /path/to/repo destination develop --debug"
     exit 1
 fi
 
-# Parameters
-WORKSPACE_DIR="$1"
-REMOTE="${2:-destination}"  # Default to 'origin' if not provided
-BRANCH="${3:-develop}"      # Default to '5.4' if not provided
+# Parse parameters and check for --debug flag
+DEBUG_MODE=false
+POSITIONAL_ARGS=()
+
+for arg in "$@"; do
+    if [ "$arg" = "--debug" ]; then
+        DEBUG_MODE=true
+    else
+        POSITIONAL_ARGS+=("$arg")
+    fi
+done
+
+# Set positional parameters
+WORKSPACE_DIR="${POSITIONAL_ARGS[0]}"
+REMOTE="${POSITIONAL_ARGS[1]:-destination}"  # Default to 'destination' if not provided
+BRANCH="${POSITIONAL_ARGS[2]:-develop}"      # Default to 'develop' if not provided
 
 # Configuration
+SOURCE_REMOTE="origin"  # Always sync from origin
 BATCH_SIZE=50
 FORCE_PUSH=true
 
@@ -91,8 +111,16 @@ fi
 echo "Switching to workspace: $WORKSPACE_DIR"
 cd "$WORKSPACE_DIR" || exit 1
 
-echo "Using remote: $REMOTE"
+echo "Syncing from: $SOURCE_REMOTE -> $REMOTE"
 echo "Using branch: $BRANCH"
+
+# Validate source remote exists
+if ! git remote get-url $SOURCE_REMOTE > /dev/null 2>&1; then
+    echo "Error: Source remote '$SOURCE_REMOTE' not found"
+    echo "Available remotes:"
+    git remote -v
+    exit 1
+fi
 
 # Check if remote is 'origin' and ask for confirmation
 if [ "$REMOTE" = "origin" ]; then
@@ -116,22 +144,30 @@ fi
 
 echo "Remote URL: $REMOTE_URL"
 
-# Fetch latest remote state to avoid stale info errors
-echo "Fetching latest remote state..."
+# Fetch latest state from both remotes
+echo "Fetching latest remote state from $SOURCE_REMOTE and $REMOTE..."
+# dont automatically fetch the source remote, you need to fetch it manually or with other scripts
+# git fetch --force $SOURCE_REMOTE
 git fetch --force $REMOTE
 
-#  You have to make sure the remote branch is already create, it may point to nothing
-# Then we try to compare the heads/branch to target remote's branch, then get the range to commit
-
-# check if the branch exists on the remote
-if git show-ref --quiet --verify refs/remotes/$REMOTE/$BRANCH; then
-    # if so, only push the commits that are not on the remote already
-    range=$REMOTE/$BRANCH..refs/heads/$BRANCH;
-else
-    # else error
-	echo "Error: Branch '$BRANCH' not found on remote '$REMOTE'"
-	exit 1
+# Validate source branch exists on origin
+if ! git show-ref --quiet --verify refs/remotes/$SOURCE_REMOTE/$BRANCH; then
+    echo "Error: Branch '$BRANCH' not found on source remote '$SOURCE_REMOTE'"
+    echo "Available branches on $SOURCE_REMOTE:"
+    git branch -r | grep "$SOURCE_REMOTE/"
+    exit 1
 fi
+
+# Validate destination branch exists
+if ! git show-ref --quiet --verify refs/remotes/$REMOTE/$BRANCH; then
+    echo "Error: Branch '$BRANCH' not found on destination remote '$REMOTE'"
+    echo "Available branches on $REMOTE:"
+    git branch -r | grep "$REMOTE/"
+    exit 1
+fi
+
+# Compare origin branch to destination branch (not local)
+range=$REMOTE/$BRANCH..$SOURCE_REMOTE/$BRANCH
 
 echo "range: $range"
 
@@ -147,6 +183,8 @@ if [ $total_commits -eq 0 ]; then
     echo "No commits to push"
     exit 0
 fi
+
+# Debug mode will show commits per batch and ask for confirmation before each batch
 
 # Determine push options
 if [ "$FORCE_PUSH" = true ]; then
@@ -165,14 +203,38 @@ for ((i=0; i<total_commits; i+=BATCH_SIZE)); do
         end=$((total_commits - 1))
     fi
     
-    # Get the commit hash for the end of this batch
+    # Get the commit hashes for the start and end of this batch
+    first_commit=${commits[$i]}
     target_commit=${commits[$end]}
     batch_num=$((i / BATCH_SIZE + 1))
     
-    echo "Pushing batch $batch_num/$total_batches: commits $((i+1)) to $((end+1)) (target: $target_commit)"
+    echo "Pushing batch $batch_num/$total_batches: commits $((i+1)) to $((end+1))"
+    echo "  Range: $first_commit (first) -> $target_commit (last)"
     
-    # Push this batch using the remote URL (token should be embedded)
+    # Debug mode: list commits in this batch and ask for confirmation
+    if [ "$DEBUG_MODE" = true ]; then
+        echo ""
+        echo "========== DEBUG MODE: Commits in batch $batch_num =========="
+        for ((j=i; j<=end; j++)); do
+            commit_hash=${commits[$j]}
+            commit_info=$(git log -1 --format="%h - %s" $commit_hash)
+            echo "$((j+1)). $commit_info"
+        done
+        echo "========================================================"
+        echo ""
+        read -p "Do you want to proceed with pushing batch $batch_num? [yes/no]: " batch_confirmation
+        if [ "$batch_confirmation" != "yes" ]; then
+            echo "Operation cancelled for batch $batch_num."
+            exit 0
+        fi
+        echo ""
+    fi
+    
+    # Push this batch using explicit refspecs
+    # Push commits from origin's branch to destination's branch head
+    # Pushing target_commit will include all parent commits (first_commit..target_commit range)
     echo "Executing: git push $PUSH_OPTIONS $REMOTE ${target_commit}:refs/heads/$BRANCH"
+    echo "  (This updates refs/heads/$BRANCH to point to $target_commit from $SOURCE_REMOTE/$BRANCH)"
     if git push $PUSH_OPTIONS "$REMOTE" ${target_commit}:refs/heads/$BRANCH; then
         echo "[SUCCEEDED] Batch $batch_num pushed successfully"
     else

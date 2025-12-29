@@ -9,13 +9,14 @@
 #   to avoid server limits, such as pack size limits or timeout issues when pushing many commits.
 #
 # USAGE:
-#   ./git_sync_to_remote.sh <workspace_directory> [remote] [branch] [--debug]
+#   ./git_sync_to_remote.sh <workspace_directory> [remote] [branch] [--debug] [--no-verify]
 #
 # PARAMETERS:
 #   workspace_directory (required) - Path to the git repository
 #   remote (optional)              - Destination remote name (default: destination)
 #   branch (optional)              - Branch name to sync (default: develop)
 #   --debug (optional)             - Enable debug mode (list commits per batch and require confirmation before each batch)
+#   --no-verify (optional)         - Disable verification after each batch (default: verification enabled)
 #
 # NOTE: Source remote is always 'origin'. Script syncs: origin -> destination
 #
@@ -65,22 +66,26 @@
 
 # Check if required parameters are provided
 if [ $# -lt 1 ]; then
-    echo "Usage: $0 <workspace_directory> [destination_remote] [branch] [--debug]"
+    echo "Usage: $0 <workspace_directory> [destination_remote] [branch] [--debug] [--no-verify]"
     echo "Note: Always syncs from 'origin' remote to destination remote"
     echo ""
     echo "Examples:"
     echo "  $0 /path/to/repo destination 2025.1-lts"
     echo "  $0 /path/to/repo destination develop --debug"
+    echo "  $0 /path/to/repo destination develop --no-verify"
     exit 1
 fi
 
-# Parse parameters and check for --debug flag
+# Parse parameters and check for --debug and --no-verify flags
 DEBUG_MODE=false
+VERIFY=true
 POSITIONAL_ARGS=()
 
 for arg in "$@"; do
     if [ "$arg" = "--debug" ]; then
         DEBUG_MODE=true
+    elif [ "$arg" = "--no-verify" ]; then
+        VERIFY=false
     else
         POSITIONAL_ARGS+=("$arg")
     fi
@@ -95,6 +100,9 @@ BRANCH="${POSITIONAL_ARGS[2]:-develop}"      # Default to 'develop' if not provi
 SOURCE_REMOTE="origin"  # Always sync from origin
 BATCH_SIZE=50
 FORCE_PUSH=true
+
+# Get script directory for temp folder
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Validate workspace directory
 if [ ! -d "$WORKSPACE_DIR" ]; then
@@ -186,6 +194,79 @@ fi
 
 # Debug mode will show commits per batch and ask for confirmation before each batch
 
+# Function to verify logs by comparing origin and destination branch logs
+verify_logs() {
+    if [ "$VERIFY" != true ]; then
+        return 0
+    fi
+    
+    # Fetch latest state from destination remote
+    git fetch --force $REMOTE > /dev/null 2>&1
+    
+    # Get destination's branch log
+    DEST_LOG_FILE="$TEMP_DIR/${REMOTE}_${BRANCH}.txt"
+    git log ${REMOTE}/${BRANCH} --graph --oneline --pretty=format:"%H %s" | tac > "$DEST_LOG_FILE"
+    
+    # Remove graph symbols from both logs and compare
+    # Remove graph symbols at the start of each line, then trim whitespace
+    # Use @ as delimiter since pattern contains both | and /
+    ORIGIN_CLEAN=$(sed "s@$GRAPH_SYMBOL_REGEX@@g" "$ORIGIN_LOG_FILE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
+    DEST_CLEAN=$(sed "s@$GRAPH_SYMBOL_REGEX@@g" "$DEST_LOG_FILE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
+    
+    # Count lines in both cleaned logs
+    ORIGIN_LINES=$(echo "$ORIGIN_CLEAN" | grep -c . || echo "0")
+    DEST_LINES=$(echo "$DEST_CLEAN" | grep -c . || echo "0")
+    
+    # Use minimum line count for comparison
+    MIN_LINES=$((ORIGIN_LINES < DEST_LINES ? ORIGIN_LINES : DEST_LINES))
+    
+    if [ $MIN_LINES -eq 0 ]; then
+        echo "[VERIFY] Warning: No lines to compare"
+        return 0
+    else
+        # Compare first MIN_LINES lines
+        ORIGIN_COMPARE=$(echo "$ORIGIN_CLEAN" | head -n $MIN_LINES)
+        DEST_COMPARE=$(echo "$DEST_CLEAN" | head -n $MIN_LINES)
+        
+        if [ "$ORIGIN_COMPARE" = "$DEST_COMPARE" ]; then
+            echo "[VERIFY] equal - logs match (compared first $MIN_LINES lines)"
+            return 0
+        else
+            echo "[VERIFY] FAILED - logs do not match!"
+            echo "Origin log (first $MIN_LINES lines):"
+            echo "$ORIGIN_COMPARE" | head -n 10
+            echo "..."
+            echo "Destination log (first $MIN_LINES lines):"
+            echo "$DEST_COMPARE" | head -n 10
+            echo "..."
+            echo "Stopping sync due to verification failure"
+            return 1
+        fi
+    fi
+}
+
+# Setup verification if enabled
+if [ "$VERIFY" = true ]; then
+    # Create temp directory under script's folder if it doesn't exist
+    TEMP_DIR="$SCRIPT_DIR/temp"
+    if [ ! -d "$TEMP_DIR" ]; then
+        mkdir -p "$TEMP_DIR"
+    fi
+    
+    # Get origin's branch log and save to temp file
+    ORIGIN_LOG_FILE="$TEMP_DIR/${SOURCE_REMOTE}_${BRANCH}.txt"
+    echo "Capturing origin branch log for verification: $ORIGIN_LOG_FILE"
+    git log ${SOURCE_REMOTE}/${BRANCH} --graph --oneline --pretty=format:"%H %s" | tac > "$ORIGIN_LOG_FILE"
+    
+    # Regex pattern to remove git graph symbols: |, |\, |\ , |/, |/, etc.
+    # This matches any combination of |, /, \, spaces, and * at the start of lines
+    GRAPH_SYMBOL_REGEX='^[[:space:]]*[|/\\_*[:space:]]+'
+    
+    echo "Verification enabled - will compare logs after each batch"
+else
+    echo "Verification disabled (--no-verify)"
+fi
+
 # Determine push options
 if [ "$FORCE_PUSH" = true ]; then
     PUSH_OPTIONS="--force-with-lease"
@@ -193,6 +274,15 @@ if [ "$FORCE_PUSH" = true ]; then
 else
     PUSH_OPTIONS=""
     echo "Using safe push (will fail on conflicts)"
+fi
+
+# Verify logs before starting batch pushes
+if [ "$VERIFY" = true ]; then
+    echo "Verifying initial state before batch pushes..."
+    if ! verify_logs; then
+        echo "Initial verification failed. Exiting."
+        exit 1
+    fi
 fi
 
 # Push commits in batches
@@ -237,6 +327,11 @@ for ((i=0; i<total_commits; i+=BATCH_SIZE)); do
     echo "  (This updates refs/heads/$BRANCH to point to $target_commit from $SOURCE_REMOTE/$BRANCH)"
     if git push $PUSH_OPTIONS "$REMOTE" ${target_commit}:refs/heads/$BRANCH; then
         echo "[SUCCEEDED] Batch $batch_num pushed successfully"
+        
+        # Verification: compare logs after each batch
+        if ! verify_logs; then
+            exit 1
+        fi
     else
         echo "[FAILED] Failed to push batch $batch_num"
         if [ "$FORCE_PUSH" != true ]; then

@@ -93,12 +93,14 @@ You can modify these constants in the script:
 ### How It Works
 
 1. Validates that the workspace is a valid git repository
-2. Fetches the latest state from both origin and destination remotes
-3. Finds commits in origin that are not in destination (`origin..destination`)
-4. Splits commits into batches of `BATCH_SIZE`
-5. Pushes each batch from origin to destination remote in chronological order
-6. Uses `--force-with-lease` for safe force pushing (if enabled)
-7. Verifies each batch after pushing (if verification is enabled)
+2. Fetches the latest state from destination remote (source remote should be fetched manually beforehand)
+3. Prompts for confirmation if pushing to origin (safety feature)
+4. Finds commits in origin that are not in destination (`origin..destination`)
+5. Splits commits into batches of `BATCH_SIZE`
+6. Pushes each batch from origin to destination remote in chronological order
+7. Uses `--force-with-lease` for safe force pushing (if enabled)
+8. Verifies each batch after pushing (if verification is enabled)
+9. Adds a 1-second delay between batches to reduce server load
 
 ### Detailed Example: Mirroring Unreal Engine 5.4 Branch
 
@@ -145,9 +147,11 @@ If you want to mirror Unreal Engine 5.4 branch into your own git repository:
 ### Prerequisites
 
 - Make sure you have set up your git folder and **ready to push**
+- Fetch the source remote manually before running the script (the script only fetches the destination remote automatically)
 - You may want to create the branch at your server first to avoid unnecessary errors
 - Ensure your remote URL has proper authentication embedded (e.g., token in URL)
 - Both source and destination remotes must be configured
+- The script will prompt for confirmation if you attempt to push to origin (as a safety measure)
 
 ### Troubleshooting
 

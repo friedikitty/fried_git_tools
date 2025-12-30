@@ -77,6 +77,26 @@ from pathlib import Path
 from run_command import run_command, run_command_and_get_return_info, run_command_and_ensure_zero
 
 
+class ConsoleCommandLogger:
+    """Simple logger for command output that writes to console with clear separation."""
+    
+    def __init__(self, prefix="[CMD]"):
+        """
+        Initialize console logger.
+        
+        :param prefix: Prefix to use for separating command logs from main process logs
+        """
+        self.prefix = prefix
+    
+    def info(self, message):
+        """Log info message to console."""
+        print(f"{self.prefix} {message}")
+    
+    def error(self, message):
+        """Log error message to console."""
+        print(f"{self.prefix} ERROR: {message}")
+
+
 # Configuration
 SOURCE_REMOTE = "origin"  # Always sync from origin
 BATCH_SIZE = 50
@@ -86,6 +106,35 @@ REGEX_PUSH_ERROR = "ERROR"
 # Get script directory for temp folder
 SCRIPT_DIR = Path(__file__).parent.absolute()
 
+# Global command logger for functions that don't have context access
+_global_cmd_logger = ConsoleCommandLogger(prefix="[CMD]")
+
+
+# Regex pattern to match lines that are solid with graph symbols: |, \, //, etc.
+# This matches lines that are entirely composed of |, /, \, spaces, tabs, and *
+GIT_GRAPH_SYMBOL_REGEX = r'^[|/\\\s*]+'
+GIT_GRAPH_SYMBOL_REGEX_PATTERN = re.compile(GIT_GRAPH_SYMBOL_REGEX + '$', re.IGNORECASE)
+GIT_GRAPH_SYMBOL_REGEX_PATTERN_LEADING = re.compile(GIT_GRAPH_SYMBOL_REGEX, re.IGNORECASE)
+
+class CommitInfo:
+    """Commit info class to hold commit hash and message."""
+    def __init__(self, hash: str, message: str, is_sub_line_of_merge_commit: bool):
+        self.hash = hash
+        self.message = message
+        self.is_sub_line_of_merge_commit = is_sub_line_of_merge_commit
+
+    def __str__(self):
+        return f"{self.hash} - {self.message}{'(sub-commit)' if self.is_sub_line_of_merge_commit else ''}"
+    
+    def __eq__(self, other):
+        """Two commits are equal if they have the same hash and message."""
+        if not isinstance(other, CommitInfo):
+            return False
+        return self.hash == other.hash
+    
+    def __ne__(self, other):
+        """Two commits are not equal if they differ in hash or message."""
+        return not self.__eq__(other)
 
 class Context:
     """Context class to hold all common parameters and state."""
@@ -104,13 +153,15 @@ class Context:
         # Verification state
         self.temp_dir = None
         self.origin_log_file = None
-        self.graph_symbol_regex = None
+        self.origin_log_lines = None  # Cached origin branch log lines
         
         # Commit information
-        self.commits = []
+        self.commits: list[CommitInfo] = []
         self.total_commits = 0
         self.total_batches = 0
-        self.commit_info_cache = {}  # Cache for commit hash -> message mapping
+        
+        # Command logger for separating command output from main process logs
+        self.cmd_logger = ConsoleCommandLogger(prefix="[SUBCMD]")
 
 
 def parse_arguments():
@@ -172,7 +223,7 @@ def validate_remote(workspace_dir, remote_name):
     if result != 0:
         print(f"Error: Remote '{remote_name}' not found")
         print("Available remotes:")
-        run_command(["git", "remote", "-v"], cwd=workspace_dir)
+        run_command(["git", "remote", "-v"], cwd=workspace_dir, logger=_global_cmd_logger)
         sys.exit(1)
     
     # Get remote URL
@@ -214,7 +265,7 @@ def validate_branch_exists(workspace_dir, remote_name, branch_name):
         print(f"Error: Branch '{branch_name}' not found on remote '{remote_name}'")
         print(f"Available branches on {remote_name}:")
         # Filter branches to show only the relevant remote
-        run_command(["git", "branch", "-r"], cwd=workspace_dir)
+        run_command(["git", "branch", "-r"], cwd=workspace_dir, logger=_global_cmd_logger)
         # Also show filtered output for clarity
         try:
             output = subprocess.check_output(
@@ -235,63 +286,143 @@ def validate_branch_exists(workspace_dir, remote_name, branch_name):
         sys.exit(1)
 
 
+def filter_valid_commits(lines: list[str], debug_mode: bool) -> list[CommitInfo]:
+    """Filter out commits that are not valid."""
+    # Parse lines to extract commit hash and message, and create CommitInfo objects
+    # Format with --graph: graph_symbols commit_hash commit_message
+    # Commit hash is always 40 hex characters
+    commits = []
+    # Compile regex once for performance
+    hash_pattern = re.compile(r'\b([0-9a-f]{40})\b', re.IGNORECASE)
+    
+    for line in lines:
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue
+        # Skip lines that are entirely graph symbols (same approach as verify_logs)
+        if GIT_GRAPH_SYMBOL_REGEX_PATTERN.match(line_stripped):
+            continue
+        
+        # Remove leading graph symbols from lines that have content (same approach as verify_logs)
+        cleaned_line = GIT_GRAPH_SYMBOL_REGEX_PATTERN_LEADING.sub("", line).strip()
+
+        is_sub_line_of_merge_commit = False
+        if line_stripped.startswith('|'):  # It's a sub line of a merge commit
+            is_sub_line_of_merge_commit = True
+        
+        # Find the 40-character hex string (commit hash) in the cleaned line
+        hash_match = hash_pattern.search(cleaned_line)
+        if hash_match:
+            commit_hash = hash_match.group(1)
+            # Get everything after the hash as the message
+            hash_pos = hash_match.end()
+            commit_msg = cleaned_line[hash_pos:].strip()
+            # Create CommitInfo object
+            commits.append(CommitInfo(commit_hash, commit_msg, is_sub_line_of_merge_commit))
+        else:
+            # Fallback: if no hash found, skip this line (shouldn't happen)
+            if debug_mode:
+                print(f"Warning: Could not parse commit hash from line: {line[:80]}")
+    
+    # Reverse to get chronological order (oldest first)
+    #commits = list(reversed(commits))
+    print(f"Found {len(commits)} commits to push (including merge commits)")
+    return commits
+
 def get_commits_to_push(ctx: Context) -> list:
     """Get list of commits to push in chronological order.
     
-    Uses 'git log --graph --oneline' to match the same traversal
-    as the visual log, ensuring merge commits are included.
-    Then reverses the commits to get chronological order (oldest first).
-    Also caches commit messages for fast lookup in show_batch_commits.
+    Gets the HEAD commit of destination branch, finds it in the cached origin log,
+    and returns all commits after that point. This preserves graph structure.
     """
-    range_spec = f"{ctx.dest_remote}/{ctx.branch}..{ctx.source_remote}/{ctx.branch}"
-    print(f"range: {range_spec}")
+    if ctx.origin_log_lines is None:
+        print("Error: Origin log not cached. setup_verification must be called first.")
+        sys.exit(1)
     
-    # Use 'git log --graph --oneline --format=%H %s' to get commit hashes and messages
-    # in the same order as 'git log --graph --oneline' would show them.
-    # This ensures merge commits are included and matches the visual log.
-    # Then reverse the commits to get chronological order (oldest first).
-    cmd = ["git", "log", "--graph", "--oneline", "--format=%H %s", range_spec]
-    print(f"Running: {cmd}")
+    # Get destination branch HEAD commit hash and commit count
+    # Get both upfront to avoid conditional second call
+    print(f"Getting destination branch info: {ctx.dest_remote}/{ctx.branch}")
+    
+    # Get commit count
+    cmd_count = ["git", "rev-list", "--count", f"{ctx.dest_remote}/{ctx.branch}"]
     try:
-        output = subprocess.check_output(
-            cmd,
+        count_output = subprocess.check_output(
+            cmd_count,
             cwd=ctx.workspace_dir,
             text=True,
             encoding="utf-8",
             errors="replace"
         )
-        lines = [line.strip() for line in output.strip().splitlines() if line.strip()]
-        
-        # Parse lines to extract commit hash and message, and build cache
-        # Format with --graph: graph_symbols commit_hash commit_message
-        # Commit hash is always 40 hex characters
-        commits = []
-        ctx.commit_info_cache = {}
-        # Compile regex once for performance
-        hash_pattern = re.compile(r'\b([0-9a-f]{40})\b', re.IGNORECASE)
-        for line in lines:
-            # Find the 40-character hex string (commit hash) in the line
-            # It may have graph symbols before it
-            # Match a 40-character hex string
-            hash_match = hash_pattern.search(line)
-            if hash_match:
-                commit_hash = hash_match.group(1)
-                # Get everything after the hash as the message
-                hash_pos = hash_match.end()
-                commit_msg = line[hash_pos:].strip()
-                commits.append(commit_hash)
-                ctx.commit_info_cache[commit_hash] = commit_msg
-            else:
-                # Fallback: if no hash found, skip this line (shouldn't happen)
-                print(f"Warning: Could not parse commit hash from line: {line[:80]}")
-        
-        # Reverse to get chronological order (oldest first)
-        commits = list(reversed(commits))
-        print(f"Found {len(commits)} commits to push (including merge commits)")
-        return commits
+        dest_commit_count = int(count_output.strip())
     except subprocess.CalledProcessError as e:
-        print(f"Error: Failed to get commit list: {e}")
+        print(f"Error: Failed to get destination branch commit count: {e}")
         sys.exit(1)
+    
+    # Get HEAD hash
+    cmd_head = ["git", "rev-parse", f"{ctx.dest_remote}/{ctx.branch}"]
+    try:
+        dest_head_output = subprocess.check_output(
+            cmd_head,
+            cwd=ctx.workspace_dir,
+            text=True,
+            encoding="utf-8",
+            errors="replace"
+        )
+        dest_head_hash = dest_head_output.strip()
+        print(f"Destination HEAD: {dest_head_hash} (branch has {dest_commit_count} commit(s))")
+    except subprocess.CalledProcessError as e:
+        print(f"Error: Failed to get destination branch HEAD: {e}")
+        sys.exit(1)
+    
+    # Parse origin log into CommitInfo objects
+    origin_commits = filter_valid_commits(reversed(ctx.origin_log_lines), ctx.debug_mode)
+    
+    # Find the destination HEAD in the origin log
+    dest_head_idx = None
+    for idx, commit in enumerate(origin_commits):
+        if commit.hash == dest_head_hash:
+            dest_head_idx = idx
+            break
+    
+    if dest_head_idx is None:
+        # Destination HEAD not found in origin log
+        print(f"Warning: Destination HEAD {dest_head_hash} not found in origin log.")
+        print(f"Destination branch has {dest_commit_count} commit(s)")
+        
+        if dest_commit_count > 1:
+            print(f"Error: Destination branch has {dest_commit_count} commits but HEAD not found in origin log.")
+            print("This indicates the branches have diverged. Cannot safely push all commits.")
+            sys.exit(1)
+        else:
+            # Destination branch has 0 or 1 commit, safe to push all
+            print(f"Destination branch has {dest_commit_count} commit(s), pushing all origin commits.")
+            commits_to_push = origin_commits
+    else:
+        # Get all commits after the destination HEAD
+        commits_to_push = origin_commits[dest_head_idx + 1:]
+        print(f"Found destination HEAD at position {dest_head_idx + 1} in origin log")
+    
+    print(f"Found {len(commits_to_push)} commits to push (origin has {len(origin_commits)} total)")
+    
+    # In debug mode, write comparison to temp file
+    if ctx.debug_mode:
+        if ctx.temp_dir is None:
+            ctx.temp_dir = Path(ctx.workspace_dir) / "temp"
+        ctx.temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        comparison_file = ctx.temp_dir / f"commits_comparison_{ctx.branch}.txt"
+        with open(comparison_file, "w", encoding="utf-8", newline='\n') as f:
+            f.write(f"Destination HEAD: {dest_head_hash}\n")
+            f.write(f"Destination HEAD position in origin log: {dest_head_idx + 1 if dest_head_idx is not None else 'NOT FOUND'}\n")
+            f.write(f"Origin commits: {len(origin_commits)}\n")
+            f.write(f"Commits to push: {len(commits_to_push)}\n")
+            f.write("\n" + "=" * 80 + "\n")
+            f.write("Commits to push:\n")
+            for commit in commits_to_push:
+                f.write(f"{commit}\n")
+        print(f"[DEBUG] Wrote commits comparison to: {comparison_file}")
+    
+    return commits_to_push
 
 
 def verify_logs(ctx: Context) -> bool:
@@ -303,7 +434,7 @@ def verify_logs(ctx: Context) -> bool:
     # git fetch outputs info to stderr, so use stderr_to_stdout=True to treat it as normal output
     # error_regex will catch actual error messages
     run_command(["git", "fetch", "--force", ctx.dest_remote], cwd=ctx.workspace_dir, 
-                stderr_to_stdout=True, error_regex=".*error.*")
+                logger=ctx.cmd_logger, stderr_to_stdout=True, error_regex=".*error.*")
     
     # Get destination's branch log
     dest_log_file = ctx.temp_dir / f"{ctx.dest_remote}_{ctx.branch}.txt"
@@ -336,19 +467,14 @@ def verify_logs(ctx: Context) -> bool:
     with open(dest_log_file, "r", encoding="utf-8", newline='\n') as f:
         dest_lines = f.readlines()
     
-    # Remove graph symbols and clean lines
-    pattern = re.compile(ctx.graph_symbol_regex)
-    origin_clean = []
-    for line in origin_lines:
-        cleaned = pattern.sub("", line).strip()
-        if cleaned:
-            origin_clean.append(cleaned)
+    # Remove lines that are solid with graph symbols (|, \, //) and clean lines
+    # Pattern 1: Match lines that are entirely graph symbols (to skip them)
+    #
+    #  Pattern 2: Remove leading graph symbols from lines that have content
     
-    dest_clean = []
-    for line in dest_lines:
-        cleaned = pattern.sub("", line).strip()
-        if cleaned:
-            dest_clean.append(cleaned)
+    origin_clean = filter_valid_commits(origin_lines, ctx.debug_mode)
+    
+    dest_clean = filter_valid_commits(dest_lines, ctx.debug_mode)
     
     # Count lines
     origin_lines_count = len(origin_clean)
@@ -383,48 +509,50 @@ def verify_logs(ctx: Context) -> bool:
         # Print first mismatch information
         if first_mismatch_line_num is not None:
             print(f"First mismatch at line {first_mismatch_line_num}:")
-            print(f"  Origin:   {first_mismatch_origin}")
-            print(f"  Dest:     {first_mismatch_dest}")
+            print(f"  Origin:   {first_mismatch_origin}, file: {ctx.origin_log_file}")
+            print(f"  Dest:     {first_mismatch_dest}, file: {dest_log_file}")
             print("")
         
-        # Print last 10 lines instead of first 10
-        print(f"Origin log (last 10 of {min_lines} compared lines):")
-        if len(origin_compare) > 10:
+        # Print 10 lines from both sides starting from the mismatch line
+        mismatch_idx = first_mismatch_line_num - 1 if first_mismatch_line_num else 0
+        start_idx = max(0, mismatch_idx)
+        end_idx = min(len(origin_compare), mismatch_idx + 10)
+        
+        print(f"Origin log (lines {start_idx + 1} to {end_idx} of {min_lines} compared lines):")
+        if start_idx > 0:
             print("...")
-            for line in origin_compare[-10:]:
-                print(line)
-        else:
-            for line in origin_compare:
-                print(line)
+        for i in range(start_idx, end_idx):
+            print(f"  {i + 1}: {origin_compare[i]}")
+        if end_idx < len(origin_compare):
+            print("...")
         print("")
-        print(f"Destination log (last 10 of {min_lines} compared lines):")
-        if len(dest_compare) > 10:
+        
+        print(f"Destination log (lines {start_idx + 1} to {end_idx} of {min_lines} compared lines):")
+        if start_idx > 0:
             print("...")
-            for line in dest_compare[-10:]:
-                print(line)
-        else:
-            for line in dest_compare:
-                print(line)
+        for i in range(start_idx, end_idx):
+            print(f"  {i + 1}: {dest_compare[i]}")
+        if end_idx < len(dest_compare):
+            print("...")
         print("")
         print("Stopping sync due to verification failure")
         return False
 
 
 def setup_verification(ctx: Context):
-    """Setup verification if enabled."""
-    if not ctx.verify:
-        print("Verification disabled (--no-verify)")
-        return
+    """Setup verification and cache origin branch log.
     
+    This must be called before get_commits_to_push to cache the origin log.
+    """
     # Create temp directory under script's folder if it doesn't exist
-    ctx.temp_dir = SCRIPT_DIR / "temp"
+    ctx.temp_dir = Path(ctx.workspace_dir) / "temp"
     ctx.temp_dir.mkdir(parents=True, exist_ok=True)
     
-    # Get origin's branch log and save to temp file
+    # Get origin's branch log and cache it
     ctx.origin_log_file = ctx.temp_dir / f"{ctx.source_remote}_{ctx.branch}.txt"
-    print(f"Capturing origin branch log for verification: {ctx.origin_log_file}")
+    print(f"Capturing origin branch log: {ctx.origin_log_file}")
     
-    cmd = ["git", "log", f"{ctx.source_remote}/{ctx.branch}", "--graph", "--oneline", "--pretty=format:%H %s"]
+    cmd = ["git", "log", f"{ctx.source_remote}/{ctx.branch}", "--graph", "--oneline", "--format=%H %s"]
     try:
         output = subprocess.check_output(
             cmd,
@@ -433,23 +561,26 @@ def setup_verification(ctx: Context):
             encoding="utf-8",
             errors="replace"
         )
-        # Reverse the output (equivalent to tac)
-        lines = output.strip().splitlines()
-        reversed_lines = list(reversed(lines))
+        # Store the lines (not reversed) - we'll reverse when processing
+        ctx.origin_log_lines = output.strip().splitlines()
+        
+        # Reverse the output for saving to file (equivalent to tac)
+        reversed_lines = list(reversed(ctx.origin_log_lines))
         # Use newline='\n' to ensure consistent LF line endings on Windows/MINGW
         with open(ctx.origin_log_file, "w", encoding="utf-8", newline='\n') as f:
             f.write("\n".join(reversed_lines))
             if reversed_lines:
                 f.write("\n")
+        
+        print(f"Cached {len(ctx.origin_log_lines)} lines from origin branch log")
+        
+        if ctx.verify:
+            print("Verification enabled - will compare logs after each batch")
+        else:
+            print("Verification disabled (--no-verify)")
     except subprocess.CalledProcessError as e:
         print(f"Error: Failed to capture origin log: {e}")
         sys.exit(1)
-    
-    # Regex pattern to remove git graph symbols: |, |\, |\ , |/, |/, etc.
-    # This matches any combination of |, /, \, spaces, and * at the start of lines
-    ctx.graph_symbol_regex = r'^[ \t]*[|/\\_* \t]+'
-    
-    print("Verification enabled - will compare logs after each batch")
 
 
 def get_push_command(ctx: Context, target_commit: str) -> tuple:
@@ -498,33 +629,19 @@ def show_batch_commits(ctx: Context, start_idx: int, end_idx: int, batch_num: in
     
     # Show the push command that will be executed
     _, cmd_str = get_push_command(ctx, target_commit)
+    
+    print("========================================================")
+    for j in range(start_idx, end_idx + 1):
+        commit_info = ctx.commits[j]
+        # Format as short hash - message (matching git log -1 --format=%h - %s)
+        #short_hash = commit_info.hash[:7]
+        if commit_info.is_sub_line_of_merge_commit:
+            print(f"{j}. sub-commit, skipped: {commit_info.hash} - {commit_info.message}")
+            continue
+        print(f"{j}. {commit_info.hash} - {commit_info.message}")
+    print("========================================================")
     print(f"Push command: {cmd_str}")
     print(f"  (This will update refs/heads/{ctx.branch} to point to {target_commit} from {ctx.source_remote}/{ctx.branch})")
-    print("")
-    
-    for j in range(start_idx, end_idx + 1):
-        commit_hash = ctx.commits[j]
-        # Use cached commit message if available
-        if commit_hash in ctx.commit_info_cache:
-            commit_msg = ctx.commit_info_cache[commit_hash]
-            # Format as short hash - message (matching git log -1 --format=%h - %s)
-            short_hash = commit_hash[:7]
-            print(f"{j+1}. {short_hash} - {commit_msg}")
-        else:
-            # Fallback to git log if cache miss (shouldn't happen)
-            cmd = ["git", "log", "-1", "--format=%h - %s", commit_hash]
-            try:
-                output = subprocess.check_output(
-                    cmd,
-                    cwd=ctx.workspace_dir,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace"
-                )
-                commit_info = output.strip()
-                print(f"{j+1}. {commit_info}")
-            except subprocess.CalledProcessError as e:
-                print(f"{j+1}. {commit_hash} (failed to get commit info: {e})")
     print("========================================================")
     print("")
 
@@ -562,17 +679,20 @@ def main():
     # Fetch latest state from destination remote
     print(f"Fetching latest remote state from {ctx.source_remote} and {ctx.dest_remote}...")
     # Don't automatically fetch the source remote, you need to fetch it manually or with other scripts
-    # run_command(["git", "fetch", "--force", ctx.source_remote], cwd=ctx.workspace_dir)
+    # run_command(["git", "fetch", "--force", ctx.source_remote], cwd=ctx.workspace_dir, logger=ctx.cmd_logger)
     # git fetch outputs info to stderr, so use stderr_to_stdout=True to treat it as normal output
     # error_regex will catch actual error messages
     run_command(["git", "fetch", "--force", ctx.dest_remote], cwd=ctx.workspace_dir,
-                stderr_to_stdout=True, error_regex=".*error.*")
+                logger=ctx.cmd_logger, stderr_to_stdout=True, error_regex=".*error.*")
     
     # Validate branches exist
     validate_branch_exists(ctx.workspace_dir, ctx.source_remote, ctx.branch)
     validate_branch_exists(ctx.workspace_dir, ctx.dest_remote, ctx.branch)
     
-    # Get commits to push
+    # Setup verification and cache origin branch log (must be before get_commits_to_push)
+    setup_verification(ctx)
+    
+    # Get commits to push (uses cached origin log)
     ctx.commits = get_commits_to_push(ctx)
     ctx.total_commits = len(ctx.commits)
     ctx.total_batches = (ctx.total_commits + BATCH_SIZE - 1) // BATCH_SIZE
@@ -582,9 +702,6 @@ def main():
     if ctx.total_commits == 0:
         print("No commits to push")
         sys.exit(0)
-    
-    # Setup verification if enabled
-    setup_verification(ctx)
     
     # Determine push options
     if FORCE_PUSH:
@@ -607,8 +724,25 @@ def main():
         end = min(i + BATCH_SIZE - 1, ctx.total_commits - 1)
         
         # Get the commit hashes for the start and end of this batch
-        first_commit = ctx.commits[i]
-        target_commit = ctx.commits[end]
+        first_commit = ctx.commits[i].hash
+        
+        # Find target_commit, skipping sub-commits of merge commits
+        target_idx = end
+        while target_idx >= i and ctx.commits[target_idx].is_sub_line_of_merge_commit:
+            if ctx.debug_mode:
+                print(f"Skipping sub-commit of merge commit: {ctx.commits[target_idx]}")
+            target_idx -= 1
+        
+        # If we went back too far, use the first commit in the batch
+        if target_idx < i + 1: # find next 
+            target_idx = end
+            while target_idx < len(ctx.commits) and ctx.commits[target_idx].is_sub_line_of_merge_commit:
+                if ctx.debug_mode:
+                    print(f"Skipping sub-commit of merge commit: {ctx.commits[target_idx]}")
+                target_idx += 1
+            
+        
+        target_commit = ctx.commits[target_idx].hash
         batch_num = (i // BATCH_SIZE) + 1
         
         print(f"Pushing batch {batch_num}/{ctx.total_batches}: commits {i+1} to {end+1}")
@@ -616,7 +750,7 @@ def main():
         
         # Debug mode: list commits in this batch and ask for confirmation
         if ctx.debug_mode:
-            show_batch_commits(ctx, i, end, batch_num, target_commit)
+            show_batch_commits(ctx, i, target_idx, batch_num, target_commit)
             batch_confirmation = input(f"Do you want to proceed with pushing batch {batch_num}? [yes/no]: ")
             if batch_confirmation != "yes":
                 print(f"Operation cancelled for batch {batch_num}.")
@@ -632,7 +766,7 @@ def main():
             # git fetch outputs info to stderr, so use stderr_to_stdout=True to treat it as normal output
             # error_regex will catch actual error messages
             run_command(["git", "fetch", "--force", ctx.dest_remote, ctx.branch], cwd=ctx.workspace_dir,
-                        stderr_to_stdout=True, error_regex=".*error.*")
+                        logger=ctx.cmd_logger, stderr_to_stdout=True, error_regex=".*error.*")
             
             # Verification: compare logs after each batch
             if not verify_logs(ctx):

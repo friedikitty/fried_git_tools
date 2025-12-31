@@ -160,6 +160,12 @@ class Context:
         self.total_commits = 0
         self.total_batches = 0
         
+        # LFS state
+        self.is_using_lfs = False
+        
+        # Destination branch state (for LFS range calculation)
+        self.dest_head_hash = None
+        
         # Command logger for separating command output from main process logs
         self.cmd_logger = ConsoleCommandLogger(prefix="[SUBCMD]")
 
@@ -228,13 +234,7 @@ def validate_remote(workspace_dir, remote_name):
     
     # Get remote URL
     try:
-        output = subprocess.check_output(
-            cmd,
-            cwd=workspace_dir,
-            text=True,
-            encoding="utf-8",
-            errors="replace"
-        )
+        output = run_command_and_get_return_info(cmd, cwd=workspace_dir, shell=False)
         remote_url = output.strip()
         return remote_url
     except subprocess.CalledProcessError as e:
@@ -268,13 +268,7 @@ def validate_branch_exists(workspace_dir, remote_name, branch_name):
         run_command(["git", "branch", "-r"], cwd=workspace_dir, logger=_global_cmd_logger)
         # Also show filtered output for clarity
         try:
-            output = subprocess.check_output(
-                ["git", "branch", "-r"],
-                cwd=workspace_dir,
-                text=True,
-                encoding="utf-8",
-                errors="replace"
-            )
+            output = run_command_and_get_return_info(["git", "branch", "-r"], cwd=workspace_dir, shell=False)
             filtered = [line.strip() for line in output.strip().splitlines() 
                        if line.strip().startswith(f"{remote_name}/")]
             if filtered:
@@ -346,13 +340,7 @@ def get_commits_to_push(ctx: Context) -> list:
     # Get commit count
     cmd_count = ["git", "rev-list", "--count", f"{ctx.dest_remote}/{ctx.branch}"]
     try:
-        count_output = subprocess.check_output(
-            cmd_count,
-            cwd=ctx.workspace_dir,
-            text=True,
-            encoding="utf-8",
-            errors="replace"
-        )
+        count_output = run_command_and_get_return_info(cmd_count, cwd=ctx.workspace_dir, shell=False)
         dest_commit_count = int(count_output.strip())
     except subprocess.CalledProcessError as e:
         print(f"Error: Failed to get destination branch commit count: {e}")
@@ -361,14 +349,9 @@ def get_commits_to_push(ctx: Context) -> list:
     # Get HEAD hash
     cmd_head = ["git", "rev-parse", f"{ctx.dest_remote}/{ctx.branch}"]
     try:
-        dest_head_output = subprocess.check_output(
-            cmd_head,
-            cwd=ctx.workspace_dir,
-            text=True,
-            encoding="utf-8",
-            errors="replace"
-        )
+        dest_head_output = run_command_and_get_return_info(cmd_head, cwd=ctx.workspace_dir, shell=False)
         dest_head_hash = dest_head_output.strip()
+        ctx.dest_head_hash = dest_head_hash  # Store in context for LFS range calculation
         print(f"Destination HEAD: {dest_head_hash} (branch has {dest_commit_count} commit(s))")
     except subprocess.CalledProcessError as e:
         print(f"Error: Failed to get destination branch HEAD: {e}")
@@ -440,13 +423,7 @@ def verify_logs(ctx: Context) -> bool:
     dest_log_file = ctx.temp_dir / f"{ctx.dest_remote}_{ctx.branch}.txt"
     cmd = ["git", "log", f"{ctx.dest_remote}/{ctx.branch}", "--graph", "--oneline", "--pretty=format:%H %s"]
     try:
-        output = subprocess.check_output(
-            cmd,
-            cwd=ctx.workspace_dir,
-            text=True,
-            encoding="utf-8",
-            errors="replace"
-        )
+        output = run_command_and_get_return_info(cmd, cwd=ctx.workspace_dir, shell=False)
         # Reverse the output (equivalent to tac)
         lines = output.strip().splitlines()
         reversed_lines = list(reversed(lines))
@@ -554,13 +531,7 @@ def setup_verification(ctx: Context):
     
     cmd = ["git", "log", f"{ctx.source_remote}/{ctx.branch}", "--graph", "--oneline", "--format=%H %s"]
     try:
-        output = subprocess.check_output(
-            cmd,
-            cwd=ctx.workspace_dir,
-            text=True,
-            encoding="utf-8",
-            errors="replace"
-        )
+        output = run_command_and_get_return_info(cmd, cwd=ctx.workspace_dir, shell=False)
         # Store the lines (not reversed) - we'll reverse when processing
         ctx.origin_log_lines = output.strip().splitlines()
         
@@ -581,6 +552,207 @@ def setup_verification(ctx: Context):
     except subprocess.CalledProcessError as e:
         print(f"Error: Failed to capture origin log: {e}")
         sys.exit(1)
+
+
+def is_lfs_enabled(workspace_dir: str) -> bool:
+    """Check if Git LFS is enabled in the repository."""
+    try:
+        # Check if .gitattributes exists and contains filter=lfs
+        gitattributes_path = os.path.join(workspace_dir, ".gitattributes")
+        if os.path.exists(gitattributes_path):
+            with open(gitattributes_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+                if "filter=lfs" in content:
+                    return True
+        
+        # Also check if git lfs is installed and repo has LFS tracked files
+        result = subprocess.run(
+            ["git", "lfs", "ls-files"],
+            cwd=workspace_dir,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace"
+        )
+        # If command succeeds and has output, LFS is likely enabled
+        if result.returncode == 0 and result.stdout.strip():
+            return True
+        
+        return False
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # Git LFS not installed or not enabled
+        return False
+
+
+def find_commits_with_lfs_in_range(ctx: Context, start_commit: str, end_commit: str) -> list[str]:
+    """Find all commits in a range that contain LFS files.
+    
+    Uses git log with -G "oid sha256:" to find commits that contain LFS file references.
+    
+    Args:
+        ctx: Context object
+        start_commit: Starting commit SHA (exclusive, not included in range)
+        end_commit: Ending commit SHA (inclusive, included in range)
+    
+    Returns:
+        list[str]: List of commit SHAs that contain LFS files, in chronological order
+    """
+    try:
+        # Use git log to find commits with LFS files in the range
+        # Range format: start..end means commits reachable from end but not from start
+        cmd = [
+            "git", "log",
+            f"{start_commit}..{end_commit}",
+            "-G", "oid sha256:",
+            "--name-only",
+            "--pretty=format:%H %s"
+        ]
+        
+        output = run_command_and_get_return_info(cmd, cwd=ctx.workspace_dir, shell=False)
+        
+        # Parse output to extract unique commit SHAs
+        # Format: commit_hash commit_message\nfile1\nfile2\n\ncommit_hash2...
+        # git log returns commits in reverse chronological order (newest first)
+        commit_shas = []
+        seen_commits = set()
+        
+        for line in output.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Check if line starts with a 40-character hex string (commit hash)
+            if len(line) >= 40:
+                # Try to extract commit hash (first 40 chars should be hex)
+                potential_hash = line[:40]
+                if all(c in '0123456789abcdefABCDEF' for c in potential_hash):
+                    if potential_hash not in seen_commits:
+                        commit_shas.append(potential_hash)
+                        seen_commits.add(potential_hash)
+        
+        # Reverse to get chronological order (oldest first) for consistency
+        commit_shas.reverse()
+        
+        return commit_shas
+        
+    except subprocess.CalledProcessError as e:
+        print(f"Warning: Failed to find commits with LFS files: {e}")
+        return []
+    except Exception as e:
+        print(f"Warning: Error finding commits with LFS files: {e}")
+        return []
+
+
+def fetch_lfs_objects_for_commit(ctx: Context, commit_sha: str) -> bool:
+    """Fetch Git LFS objects for a specific commit by creating a temp branch.
+    
+    Creates a temporary local branch at the commit, fetches LFS objects
+    for that branch, then cleans up the temporary branch.
+    
+    Args:
+        ctx: Context object
+        commit_sha: Commit SHA to fetch LFS objects for
+    
+    Returns:
+        bool: True if successful, False on error
+    """
+    temp_branch_name = f"temp_lfs_fetch_{commit_sha[:8]}"
+    
+    try:
+        # Create temporary branch at commit
+        result = run_command(
+            ["git", "branch", temp_branch_name, commit_sha],
+            cwd=ctx.workspace_dir,
+            logger=ctx.cmd_logger
+        )
+        
+        if result != 0:
+            print(f"Warning: Failed to create temporary branch for commit {commit_sha[:8]} (return code: {result})")
+            return False
+        
+        try:
+            # Fetch LFS objects for the temporary branch
+            lfs_result = run_command(
+                ["git", "lfs", "fetch", ctx.source_remote, temp_branch_name],
+                cwd=ctx.workspace_dir,
+                logger=ctx.cmd_logger,
+                stderr_to_stdout=True
+            )
+            
+            if lfs_result == 0:
+                return True
+            else:
+                print(f"Warning: LFS fetch returned non-zero exit code {lfs_result} for commit {commit_sha[:8]}")
+                return False
+        
+        finally:
+            # Always clean up the temporary branch
+            cleanup_result = run_command(
+                ["git", "branch", "-D", temp_branch_name],
+                cwd=ctx.workspace_dir,
+                logger=ctx.cmd_logger
+            )
+            
+            if cleanup_result != 0:
+                # Non-fatal, just warn
+                print(f"Warning: Failed to delete temporary branch '{temp_branch_name}' (return code: {cleanup_result})")
+        
+        return True
+        
+    except FileNotFoundError:
+        print("Warning: git-lfs command not found. Skipping LFS fetch.")
+        return False
+    except Exception as e:
+        print(f"Warning: Error fetching LFS objects for commit {commit_sha[:8]}: {e}")
+        return False
+
+
+def fetch_lfs_objects_for_batch(ctx: Context, start_commit: str, end_commit: str, batch_num: int) -> bool:
+    """Fetch Git LFS objects for all commits in a batch that contain LFS files.
+    
+    Finds all commits in the batch range that contain LFS files, then fetches
+    LFS objects for each of those commits individually.
+    
+    Args:
+        ctx: Context object
+        start_commit: Starting commit SHA of the batch (exclusive)
+        end_commit: Ending commit SHA of the batch (inclusive)
+        batch_num: Batch number for logging
+    
+    Returns:
+        bool: True if successful or LFS not needed, False on error
+    """
+    if not ctx.is_using_lfs:
+        return True  # LFS not enabled, nothing to do
+    
+    print(f"Finding commits with LFS files in batch {batch_num} (range: {start_commit[:8]}..{end_commit[:8]})...")
+    
+    # Find all commits in the batch that contain LFS files
+    commits_with_lfs = find_commits_with_lfs_in_range(ctx, start_commit, end_commit)
+    
+    if not commits_with_lfs:
+        print(f"No commits with LFS files found in batch {batch_num}")
+        return True
+    
+    print(f"Found {len(commits_with_lfs)} commit(s) with LFS files in batch {batch_num}")
+    
+    # Fetch LFS objects for each commit
+    success_count = 0
+    for commit_sha in commits_with_lfs:
+        print(f"Fetching LFS objects for commit {commit_sha[:8]}...")
+        if fetch_lfs_objects_for_commit(ctx, commit_sha):
+            success_count += 1
+        else:
+            print(f"Warning: Failed to fetch LFS objects for commit {commit_sha[:8]}")
+            # Continue with other commits
+    
+    if success_count == len(commits_with_lfs):
+        print(f"LFS objects fetched successfully for all {success_count} commit(s) in batch {batch_num}")
+        return True
+    else:
+        print(f"Warning: Only {success_count}/{len(commits_with_lfs)} commits had LFS objects fetched successfully")
+        # Continue anyway - the push will fail if LFS objects are actually missing
+        return True
 
 
 def get_push_command(ctx: Context, target_commit: str) -> tuple:
@@ -613,6 +785,10 @@ def push_batch(ctx: Context, target_commit: str, batch_num: int) -> bool:
         # Check if output contains error keywords matching REGEX_PUSH_ERROR pattern
         if re.search(REGEX_PUSH_ERROR, output, re.IGNORECASE):
             print(f"Error detected in output: found pattern '{REGEX_PUSH_ERROR}'")
+            print(f"========================================================")
+            print(f"{output}")
+            print(f"========================================================")
+            print(f"Return code: {result.returncode}")
             return False
         
         # Also check return code
@@ -689,6 +865,13 @@ def main():
     validate_branch_exists(ctx.workspace_dir, ctx.source_remote, ctx.branch)
     validate_branch_exists(ctx.workspace_dir, ctx.dest_remote, ctx.branch)
     
+    # Check if LFS is enabled and store in context
+    ctx.is_using_lfs = is_lfs_enabled(ctx.workspace_dir)
+    if ctx.is_using_lfs:
+        print("Git LFS detected - will fetch LFS objects for each batch before pushing")
+    else:
+        print("Git LFS not detected - skipping LFS operations")
+    
     # Setup verification and cache origin branch log (must be before get_commits_to_push)
     setup_verification(ctx)
     
@@ -756,6 +939,19 @@ def main():
                 print(f"Operation cancelled for batch {batch_num}.")
                 sys.exit(0)
             print("")
+        
+        # Fetch LFS objects for this batch if LFS is enabled
+        if ctx.is_using_lfs:
+            # Determine start commit for git log range
+            # Range format: start..end means commits reachable from end but not from start
+            if i == 0:
+                # First batch: use destination HEAD as start (commits before first commit to push)
+                start_commit = ctx.dest_head_hash
+            else:
+                # Subsequent batches: use the commit before the first commit in this batch
+                start_commit = ctx.commits[i - 1].hash
+            
+            fetch_lfs_objects_for_batch(ctx, start_commit, target_commit, batch_num)
         
         # Push this batch
         if push_batch(ctx, target_commit, batch_num):

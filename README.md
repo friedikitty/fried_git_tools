@@ -15,13 +15,14 @@ This tool solves these problems by splitting commits into smaller batches and pu
 
 - **Python 3.x** (Python 3.6 or higher recommended)
 - **Git** installed and available in your PATH
-
+- **Git LFS** (optional, but recommended if your repository uses Large File Storage)
 
 ## Installation
 
 1. Clone or download this repository
 2. Ensure `run_command.py` is in the same directory as `git_sync_to_remote.py`
 3. Make sure Python 3 is installed and accessible via `python3` or `py -3`
+4. If your repository uses Git LFS, ensure Git LFS is installed and configured
 
 ## git_sync_to_remote.py
 
@@ -33,10 +34,13 @@ This script pushes git commits in batches to avoid server limits such as pack si
 
 - **Batch Processing**: Splits commits into configurable batches (default: 50 commits per batch)
 - **Safe Force Push**: Uses `--force-with-lease` by default to safely overwrite remote changes
-- **Verification**: Automatically verifies each batch after pushing to ensure integrity
-- **Debug Mode**: Preview commits before pushing each batch
-- **Merge Commit Support**: Properly handles merged revisions that the shell script version cannot
+- **Verification**: Automatically verifies each batch after pushing to ensure integrity by comparing commit logs
+- **Debug Mode**: Preview commits before pushing each batch with interactive confirmation
+- **Merge Commit Support**: Properly handles merged revisions and sub-commits that the shell script version cannot
 - **Chronological Order**: Pushes commits in chronological order (oldest first)
+- **Git LFS Support**: Automatically detects and fetches LFS objects for each batch before pushing
+- **Log Caching**: Caches origin branch logs for efficient verification and comparison
+- **Error Detection**: Advanced error detection with regex patterns to catch push failures early
 
 ### Usage
 
@@ -93,14 +97,22 @@ You can modify these constants in the script:
 ### How It Works
 
 1. Validates that the workspace is a valid git repository
-2. Fetches the latest state from destination remote (source remote should be fetched manually beforehand)
+2. Validates that both source and destination remotes exist and are configured
 3. Prompts for confirmation if pushing to origin (safety feature)
-4. Finds commits in origin that are not in destination (`origin..destination`)
-5. Splits commits into batches of `BATCH_SIZE`
-6. Pushes each batch from origin to destination remote in chronological order
-7. Uses `--force-with-lease` for safe force pushing (if enabled)
-8. Verifies each batch after pushing (if verification is enabled)
-9. Adds a 1-second delay between batches to reduce server load
+4. Fetches the latest state from destination remote (source remote should be fetched manually beforehand)
+5. Detects if Git LFS is enabled in the repository
+6. Caches the origin branch log for verification purposes
+7. Finds commits in origin that are not in destination (`origin..destination`)
+8. Filters out graph symbols and sub-commits from merge commits
+9. Splits commits into batches of `BATCH_SIZE`
+10. For each batch:
+    - If LFS is enabled, fetches LFS objects for commits in the batch range
+    - Pushes the batch from origin to destination remote in chronological order
+    - Uses `--force-with-lease` for safe force pushing (if enabled)
+    - Fetches from destination to update local references
+    - Verifies logs by comparing origin and destination commit logs (if verification is enabled)
+11. Adds a 1-second delay between batches to reduce server load
+12. Creates temporary log files in `workspace/temp/` for verification and debugging
 
 ### Detailed Example: Mirroring Unreal Engine 5.4 Branch
 
@@ -146,12 +158,57 @@ If you want to mirror Unreal Engine 5.4 branch into your own git repository:
 
 ### Prerequisites
 
-- Make sure you have set up your git folder and **ready to push**
+- Make sure you have set up your git folder and it is **ready to push**
 - Fetch the source remote manually before running the script (the script only fetches the destination remote automatically)
-- You may want to create the branch at your server first to avoid unnecessary errors
+- You may want to create the branch on your server first to avoid unnecessary errors
 - Ensure your remote URL has proper authentication embedded (e.g., token in URL)
 - Both source and destination remotes must be configured
 - The script will prompt for confirmation if you attempt to push to origin (as a safety measure)
+
+### Example: Setting Up a Branch to Sync
+
+This example shows how to set up syncing when your destination server already has a branch with different content (e.g., a main branch with a README file).
+
+Taking the master branch as an example, if your destination server already contains a main branch with a README, you need to align them first:
+
+1. **Create a dual-remote structure** (similar to the Unreal Engine example above):
+   - The source repo's remote is `origin`
+   - The destination repo's remote is `destination`
+   - For example, let's say the workspace is `/t/sync_workspace`
+
+2. **Create a branch pointing to the first commit** of `refs/remotes/origin/master`:
+   ```sh
+   # Find the first commit hash
+   git log --reverse --format="%H" refs/remotes/origin/master | head -1
+   # Create a branch named origin_master_1 pointing to that commit
+   git branch origin_master_1 <first_commit_hash>
+   ```
+   Replace `<first_commit_hash>` with the hash from the first command.
+
+3. **Optional: Use a worktree for the initial force push** (recommended):
+   ```sh
+   git worktree add ../some_dir origin_master_1
+   cd ../some_dir
+   ```
+   This step is optional, but it's better to perform the force push in a separate folder to ensure there are files and correct states for force pushing.
+
+4. **Disable branch protection** in your GitLab/GitHub settings for the master branch (required for force push).
+
+5. **Perform the initial force push** to align the branches:
+   ```sh
+   git push destination origin_master_1:master -f
+   ```
+
+6. **Return to the original folder** - it is now fully prepared for syncing:
+   ```sh
+   cd /t/sync_workspace
+   ```
+
+7. **Run the sync script**:
+   ```sh
+   py -3 git_sync_to_remote.py /t/sync_workspace destination master
+   ```
+   Now you can have a coffee and watch it do the work!
 
 ### Troubleshooting
 
@@ -162,6 +219,7 @@ If you want to mirror Unreal Engine 5.4 branch into your own git repository:
 **Error: Branch not found on remote**
 - Create the branch on the destination remote first
 - Or ensure the branch exists on both origin and destination remotes
+- Note: If the destination branch is empty (0 commits) or has only 1 commit, the script will push all origin commits automatically
 
 **Push fails with unpacker error even with batching**
 - Reduce `BATCH_SIZE` further (try 20 or 10)
@@ -194,6 +252,60 @@ This is the legacy shell script version of `git_sync_to_remote.py`.
 - Only use if you cannot run Python 3
 - For simple linear histories without merge commits
 - The Python version should be preferred in all cases
+
+
+## init_git_sync_folder.py
+
+### Description
+
+A utility script to initialize a bare Git repository and configure it for branch synchronization. This is useful for setting up mirror repositories or preparing a workspace for syncing specific branches.
+
+### Features
+
+- Creates a bare Git repository
+- Configures remote with custom branch fetch specifications
+- Supports multiple branches with explicit refspecs
+- Can be re-run safely (skips existing configurations)
+- Verification mode to check existing configurations
+
+### Usage
+
+```bash
+python init_git_sync_folder.py --repo-path <path> --remote-url <url> [options]
+```
+
+#### Parameters
+
+- `--repo-path` (required) - Path where the bare repository should be created
+- `--remote-url` (required) - URL of the remote repository (e.g., `ssh://git@example.com/repo.git`)
+- `--remote-name` (optional) - Name of the remote (default: `origin`)
+- `--branches` (optional) - List of branches to sync (default: `master`)
+- `--no-fetch` (optional) - Skip the initial fetch operation
+- `--verify-only` (optional) - Only verify existing configuration without making changes
+
+#### Examples
+
+**Basic usage:**
+```bash
+python init_git_sync_folder.py --repo-path /path/to/repo --remote-url ssh://git@example.com/repo.git
+```
+
+**Multiple branches:**
+```bash
+python init_git_sync_folder.py --repo-path /path/to/repo \
+  --remote-url ssh://git@example.com/repo.git \
+  --branches master develop release
+```
+
+- **Fetch LFS files manually**: You need to fetch LFS files from the origin remote before syncing:
+  ```sh
+  git lfs fetch origin <branch_name>
+  ```
+  This ensures all LFS files are available locally before pushing.
+
+- **Configure LFS on destination**: Your destination remote needs to have Git LFS configured separately. The script cannot configure LFS for you.
+
+- **Monitor for errors**: While the script attempts to handle LFS files during the sync process, you should watch for any LFS-related errors and resolve them manually if needed.
 
 ## License
 

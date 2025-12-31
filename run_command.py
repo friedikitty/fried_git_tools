@@ -244,7 +244,7 @@ def run_detached_command(command):
     return p
 
 
-def run_command_and_get_return_info(command, shell=True, timeout=300):
+def run_command_and_get_return_info(command, cwd=None, shell=True, encoding="utf-8", timeout=300):
     """Run command and return output info."""
     print("run_command_and_get_return_info: {}".format(command))
     try:
@@ -253,7 +253,8 @@ def run_command_and_get_return_info(command, shell=True, timeout=300):
             shell=shell,
             timeout=timeout,
             text=True,
-            # encoding="utf-8",
+            encoding=encoding,
+            cwd=cwd,
             errors="replace",
         )
         return return_info

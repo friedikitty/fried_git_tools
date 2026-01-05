@@ -17,6 +17,50 @@ import subprocess
 import sys
 
 
+class ConsoleCommandLogger:
+    """Simple logger for command output that writes to console with clear separation."""
+
+    def __init__(self, prefix="[CMD]"):
+        """
+        Initialize console logger.
+
+        :param prefix: Prefix to use for separating command logs from main process logs
+        """
+        self.prefix = prefix
+
+    def info(self, message):
+        """Log info message to console."""
+        print(f"{self.prefix} {message}")
+
+    def error(self, message):
+        """Log error message to console."""
+        print(f"{self.prefix} ERROR: {message}")
+
+
+# Inline logger class that captures output for regex error checking
+# while forwarding logs to the original logger
+class OutputCaptureLogger:
+    def __init__(self, original_logger):
+        self.original_logger = original_logger
+        self.captured_output = []
+
+    def info(self, message):
+        """Capture and forward info messages."""
+        self.captured_output.append(message)
+        if self.original_logger:
+            self.original_logger.info(message)
+
+    def error(self, message):
+        """Capture and forward error messages."""
+        self.captured_output.append(message)
+        if self.original_logger:
+            self.original_logger.error(message)
+
+    def get_output(self):
+        """Get all captured output as a single string."""
+        return "\n".join(self.captured_output)
+
+
 def _run_command_deprecated(cmd, cwd=None, logger=None, shell=False, timeout=300):
     """DEPRECATED: Old command execution using subprocess.Popen - kept for manual reference.
 
@@ -75,17 +119,25 @@ def _run_command_deprecated(cmd, cwd=None, logger=None, shell=False, timeout=300
         raise
 
 
-def _run_command(cmd, cwd=None, logger=None, shell=False, timeout=300, stderr_to_stdout=False, error_regex=None):
+def _run_command(
+    cmd,
+    cwd=None,
+    logger=None,
+    shell=False,
+    timeout=300,
+    stderr_to_stdout=False,
+    error_regex=None,
+):
     """Modern command execution using subprocess.run with automatic text handling.
 
     This is the recommended approach for Python 3 as it automatically handles
     text encoding without manual decode/encode operations.
-    
+
     :param stderr_to_stdout: If True, treat stderr as stdout (merge streams)
     :param error_regex: Optional regex pattern to detect error lines (case-insensitive)
     """
     import re
-    
+
     try:
         print(f"Running: {cmd if isinstance(cmd, str) else ' '.join(cmd)}")
         if cwd:
@@ -115,13 +167,15 @@ def _run_command(cmd, cwd=None, logger=None, shell=False, timeout=300, stderr_to
                     # Check if line matches error regex
                     is_error = error_pattern and error_pattern.search(line.strip())
                     if is_error:
-                        print(f"  | ERROR: {line.strip()}")
                         if logger:
                             logger.error(line.strip())
+                        else:
+                            print(f"  | ERROR: {line.strip()}")
                     else:
-                        print(f"  | {line.strip()}")
                         if logger:
                             logger.info(line.strip())
+                        else:
+                            print(f"  | {line.strip()}")
 
         # Process stderr
         if result.stderr:
@@ -131,18 +185,21 @@ def _run_command(cmd, cwd=None, logger=None, shell=False, timeout=300, stderr_to
                         # Treat stderr as stdout (merge streams)
                         is_error = error_pattern and error_pattern.search(line.strip())
                         if is_error:
-                            print(f"  | ERROR: {line.strip()}")
                             if logger:
                                 logger.error(line.strip())
+                            else:
+                                print(f"  | ERROR: {line.strip()}")
                         else:
-                            print(f"  | {line.strip()}")
                             if logger:
                                 logger.info(line.strip())
+                            else:
+                                print(f"  | {line.strip()}")
                     else:
                         # Default behavior: always treat stderr as error
-                        print(f"  | ERROR: {line.strip()}")
                         if logger:
                             logger.error(line.strip())
+                        else:
+                            print(f"  | ERROR: {line.strip()}")
 
         print(f"Command completed with return code: {result.returncode}")
         if logger:
@@ -174,7 +231,15 @@ def run_command_and_ensure_zero(*args, **kwargs):
         raise Exception('error command: "%s %s"' % ("".join(args), kwargs_string))
 
 
-def run_command(cmd, cwd=None, logger=None, shell=False, timeout=300, stderr_to_stdout=False, error_regex=None):
+def run_command(
+    cmd,
+    cwd=None,
+    logger=None,
+    shell=False,
+    timeout=300,
+    stderr_to_stdout=False,
+    error_regex=None,
+):
     """Run a command with real-time output.
 
     :param cmd: See subprocess.Popen, can be a single string or a list
@@ -187,7 +252,9 @@ def run_command(cmd, cwd=None, logger=None, shell=False, timeout=300, stderr_to_
     :return: Return what the command return
     """
     try:
-        return _run_command(cmd, cwd, logger, shell, timeout, stderr_to_stdout, error_regex)
+        return _run_command(
+            cmd, cwd, logger, shell, timeout, stderr_to_stdout, error_regex
+        )
     except Exception as e:
         if logger:
             logger.error(f"Command execution failed: {e}")
@@ -244,7 +311,9 @@ def run_detached_command(command):
     return p
 
 
-def run_command_and_get_return_info(command, cwd=None, shell=True, encoding="utf-8", timeout=300):
+def run_command_and_get_return_info(
+    command, cwd=None, shell=True, encoding="utf-8", timeout=300
+):
     """Run command and return output info."""
     print("run_command_and_get_return_info: {}".format(command))
     try:

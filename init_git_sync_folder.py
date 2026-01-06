@@ -31,6 +31,9 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "unreal_build_script"))
 from run_command import run_command
 
+# Import utility functions
+from git_sync_util import sanitize_remote_url
+
 
 def init_bare_repository(repo_path):
     """
@@ -85,7 +88,7 @@ def configure_remote(repo_path, remote_name, remote_url):
     """
     print(f"\n{'='*80}")
     print(f"Configuring remote: {remote_name}")
-    print(f"URL: {remote_url}")
+    print(f"URL: {sanitize_remote_url(remote_url)}")
     print(f"{'='*80}\n")
 
     # Check if remote already exists
@@ -99,14 +102,14 @@ def configure_remote(repo_path, remote_name, remote_url):
     if result.returncode == 0:
         existing_url = result.stdout.strip()
         print(
-            f"[WARNING]  Remote '{remote_name}' already exists with URL: {existing_url}"
+            f"[WARNING]  Remote '{remote_name}' already exists with URL: {sanitize_remote_url(existing_url)}"
         )
 
         if existing_url == remote_url:
             print(f"[SUCEEEDED] Remote URL matches, no changes needed")
             return True
         else:
-            print(f"Updating remote URL to: {remote_url}")
+            print(f"Updating remote URL to: {sanitize_remote_url(remote_url)}")
             result = run_command(
                 f"git remote set-url {remote_name} {remote_url}",
                 cwd=repo_path,
@@ -328,7 +331,7 @@ Examples:
     print(f"\nConfiguration:")
     print(f"  Repository Path: {repo_path}")
     print(f"  Remote Name:     {args.remote_name}")
-    print(f"  Remote URL:      {args.remote_url}")
+    print(f"  Remote URL:      {sanitize_remote_url(args.remote_url)}")
     print(f"  Branches:        {', '.join(args.branches)}")
     print(f"  Fetch After:     {'No' if args.no_fetch else 'Yes'}")
     print(f"  Mode:            {'Verify Only' if args.verify_only else 'Initialize'}")

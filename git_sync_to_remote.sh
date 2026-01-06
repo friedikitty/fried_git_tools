@@ -104,6 +104,48 @@ FORCE_PUSH=true
 # Get script directory for temp folder
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Function to sanitize remote URL by masking authentication tokens
+sanitize_remote_url() {
+    local url="$1"
+    if [ -z "$url" ]; then
+        echo "$url"
+        return
+    fi
+    
+    # Handle SSH URLs (git@host.com:user/repo.git) - typically no tokens
+    if [[ "$url" == git@* ]] || [[ "$url" == ssh://git@* ]]; then
+        # Check for token patterns in SSH URLs
+        if [[ "$url" == *"://"*"@"* ]]; then
+            # Pattern: ssh://token@host or ssh://user:token@host
+            local scheme="${url%%://*}"
+            local rest="${url#*://}"
+            if [[ "$rest" == *":"*"@"* ]]; then
+                # Has user:token format
+                local user_pass="${rest%%@*}"
+                local user="${user_pass%%:*}"
+                local host_path="${rest#*@}"
+                echo "${scheme}://${user}:***@${host_path}"
+                return
+            elif [[ "$rest" == *"@"* ]]; then
+                # Has token@ format
+                local host_path="${rest#*@}"
+                echo "${scheme}://***@${host_path}"
+                return
+            fi
+        fi
+        echo "$url"
+        return
+    fi
+    
+    # Handle standard URLs (http, https, etc.)
+    # Match patterns like ://token@ or ://user:token@
+    # Replace user:token@ with user:***@
+    local sanitized=$(echo "$url" | sed -E 's|://([^:@]+):[^@]+@|://\1:***@|g')
+    # Replace remaining token@ with ***@
+    sanitized=$(echo "$sanitized" | sed -E 's|://[^@]+@|://***@|g')
+    echo "$sanitized"
+}
+
 # Validate workspace directory
 if [ ! -d "$WORKSPACE_DIR" ]; then
     echo "Error: Workspace directory '$WORKSPACE_DIR' does not exist"
@@ -150,7 +192,7 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-echo "Remote URL: $REMOTE_URL"
+echo "Remote URL: $(sanitize_remote_url "$REMOTE_URL")"
 
 # Fetch latest state from both remotes
 echo "Fetching latest remote state from $SOURCE_REMOTE and $REMOTE..."

@@ -81,6 +81,9 @@ from run_command import (
     ConsoleCommandLogger,
 )
 
+# Import utility functions
+from git_sync_util import sanitize_remote_url
+
 # Configuration
 SOURCE_REMOTE = "origin"  # Always sync from origin
 BATCH_SIZE = 50
@@ -937,7 +940,7 @@ def main():
 
     # Get remote URL
     remote_url = validate_remote(ctx.workspace_dir, ctx.dest_remote)
-    print(f"Remote URL: {remote_url}")
+    print(f"Remote URL: {sanitize_remote_url(remote_url)}")
 
     # Fetch latest state from destination remote
     print(

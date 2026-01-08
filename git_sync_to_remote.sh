@@ -312,7 +312,7 @@ fi
 # Determine push options
 if [ "$FORCE_PUSH" = true ]; then
     PUSH_OPTIONS="--force-with-lease"
-    echo "⚠️  Force push enabled - will overwrite remote changes"
+    echo "WARNING: Force push enabled - will overwrite remote changes"
 else
     PUSH_OPTIONS=""
     echo "Using safe push (will fail on conflicts)"

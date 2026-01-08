@@ -91,3 +91,24 @@ def sanitize_remote_url(url: str) -> str:
         # Then handle token-only format (but not common usernames like 'git')
         sanitized = re.sub(r"://(?!git@)[^@]+@", r"://***@", sanitized)
         return sanitized
+
+
+
+def deep_merge(target, source):
+    """
+    Recursively merge source dictionary into target dictionary.
+    
+    :param target: Target dictionary (will be modified)
+    :param source: Dictionary to merge into target
+    :return: Merged target dictionary
+    """
+    for key, value in source.items():
+        # Core logic: if key exists and both values are dictionaries, recursively merge
+        if (key in target and 
+            isinstance(target[key], dict) and 
+            isinstance(value, dict)):
+            deep_merge(target[key], value)
+        else:
+            # Otherwise (key does not exist, or one of the values is not a dictionary), overwrite/add
+            target[key] = value
+    return target

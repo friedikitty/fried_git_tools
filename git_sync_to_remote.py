@@ -988,7 +988,7 @@ def main():
     # Determine push options
     if FORCE_PUSH:
         ctx.push_options = ["--force-with-lease"]
-        print("⚠️  Force push enabled - will overwrite remote changes")
+        print("WARNING: Force push enabled - will overwrite remote changes")
     else:
         ctx.push_options = []
         print("Using safe push (will fail on conflicts)")

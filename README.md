@@ -627,6 +627,9 @@ The tools include built-in token sanitization to prevent credential leaks in log
 - Check that the build configuration ID is correct
 - Ensure the JSON format matches what `check_remote_change.py` outputs
 
+**Add new branch to sync**
+- Just reinit the the folder; using new params;
+
 ---
 
 ## License

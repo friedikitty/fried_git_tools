@@ -22,6 +22,9 @@ class Args:
     verify_only: bool = False
     destination_remote_url: Optional[str] = None
     destination_remote_name: str = "destination"
+    no_default_ignore: bool = False
+    no_default_lfs: bool = False
+    bare: bool = True
 
     def __post_init__(self):
         """Set default for branches if None."""
@@ -114,6 +117,15 @@ def build_command_string(args):
 
     if args.verify_only:
         cmd_parts.append("--verify-only")
+
+    if args.no_default_ignore:
+        cmd_parts.append("--no-default-ignore")
+
+    if args.no_default_lfs:
+        cmd_parts.append("--no-default-lfs")
+
+    if not args.bare:
+        cmd_parts.append("--no-bare")
 
     # Destination remote arguments
     if args.destination_remote_url:
@@ -229,6 +241,27 @@ class GitSyncGUI:
             variable=self.verify_only_var,
         ).grid(row=0, column=1, sticky=tk.W, padx=10)
 
+        self.no_default_ignore_var = tk.BooleanVar()
+        ttk.Checkbutton(
+            checkbox_frame,
+            text="Skip default .gitignore (--no-default-ignore)",
+            variable=self.no_default_ignore_var,
+        ).grid(row=1, column=0, sticky=tk.W, padx=10)
+
+        self.no_default_lfs_var = tk.BooleanVar()
+        ttk.Checkbutton(
+            checkbox_frame,
+            text="Skip default .gitattributes (--no-default-lfs)",
+            variable=self.no_default_lfs_var,
+        ).grid(row=1, column=1, sticky=tk.W, padx=10)
+
+        self.bare_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            checkbox_frame,
+            text="Bare repository (--bare)",
+            variable=self.bare_var,
+        ).grid(row=2, column=0, sticky=tk.W, padx=10)
+
         # Separator
         ttk.Separator(main_frame, orient=tk.HORIZONTAL).grid(
             row=row, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=20
@@ -292,6 +325,8 @@ class GitSyncGUI:
             self.verify_only_var,
             self.dest_remote_url_var,
             self.dest_remote_name_var,
+            self.no_default_ignore_var,
+            self.no_default_lfs_var,
         ]:
             var.trace_add("write", lambda *args: self.update_command_preview())
 
@@ -333,6 +368,9 @@ class GitSyncGUI:
                 destination_remote_url=self.dest_remote_url_var.get().strip() or None,
                 destination_remote_name=self.dest_remote_name_var.get()
                 or "destination",
+                no_default_ignore=self.no_default_ignore_var.get(),
+                no_default_lfs=self.no_default_lfs_var.get(),
+                bare=self.bare_var.get(),
             )
 
             cmd_string = build_command_string(args)
@@ -373,6 +411,9 @@ class GitSyncGUI:
             destination_remote_url=self.dest_remote_url_var.get().strip() or None,
             destination_remote_name=self.dest_remote_name_var.get().strip()
             or "destination",
+            no_default_ignore=self.no_default_ignore_var.get(),
+            no_default_lfs=self.no_default_lfs_var.get(),
+            bare=self.bare_var.get(),
         )
 
         # Print the simulated command-line call

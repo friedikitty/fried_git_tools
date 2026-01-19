@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*- 
+# -*- coding: utf-8 -*-
 """
 Git Remote Branch Change Detection Script
 
@@ -203,11 +203,11 @@ def get_all_branch_hashes(
     """
     # Use remote branches for the specified remote
     local_branches = get_local_branches(workspace_dir, remote_name)
-    
+
     # Filter branches if limit_branches is specified
     if limit_branches:
         local_branches = [b for b in local_branches if b in limit_branches]
-    
+
     branch_hashes = {}
 
     for branch_name in local_branches:
@@ -243,16 +243,20 @@ def get_all_branch_hashes_two_remotes(
     remote1_branches = get_local_branches(workspace_dir, remote1_name)
     remote2_branches = get_local_branches(workspace_dir, remote2_name)
     all_branches = sorted(set(remote1_branches + remote2_branches))
-    
+
     # Filter branches if limit_branches is specified
     if limit_branches:
         all_branches = [b for b in all_branches if b in limit_branches]
-    
+
     branch_hashes = {}
 
     for branch_name in all_branches:
-        remote1_hash = get_remote_branch_commit(workspace_dir, remote1_name, branch_name)
-        remote2_hash = get_remote_branch_commit(workspace_dir, remote2_name, branch_name)
+        remote1_hash = get_remote_branch_commit(
+            workspace_dir, remote1_name, branch_name
+        )
+        remote2_hash = get_remote_branch_commit(
+            workspace_dir, remote2_name, branch_name
+        )
 
         branch_hashes[branch_name] = {
             "remote1": remote1_hash,
@@ -262,9 +266,7 @@ def get_all_branch_hashes_two_remotes(
     return branch_hashes
 
 
-def compare_branches(
-    branches: Dict[str, Dict[str, Optional[str]]]
-) -> ComparisonResult:
+def compare_branches(branches: Dict[str, Dict[str, Optional[str]]]) -> ComparisonResult:
     """Compare local and remote branch commit hashes.
 
     Args:
@@ -295,9 +297,7 @@ def compare_branches(
             if local_hash is not None:
                 unchanged[branch_name] = local_hash
 
-    return ComparisonResult(
-        changed=changed, no_remote=no_remote, unchanged=unchanged
-    )
+    return ComparisonResult(changed=changed, no_remote=no_remote, unchanged=unchanged)
 
 
 def compare_two_remotes(
@@ -412,7 +412,9 @@ def print_remote_comparison_result(
     if result.changed:
         has_changes = True
         print("\n" + "=" * 80)
-        print(f"WARNING: BRANCHES DIFFER between '{remote1_name}' and '{remote2_name}':")
+        print(
+            f"WARNING: BRANCHES DIFFER between '{remote1_name}' and '{remote2_name}':"
+        )
         print("=" * 80)
         for branch_name, comp in result.changed.items():
             print(f"\n  Branch: {branch_name}")
@@ -435,7 +437,9 @@ def print_remote_comparison_result(
 
     if not has_changes:
         print("\n" + "=" * 80)
-        print(f"OK: NO DIFFERENCES DETECTED between '{remote1_name}' and '{remote2_name}'")
+        print(
+            f"OK: NO DIFFERENCES DETECTED between '{remote1_name}' and '{remote2_name}'"
+        )
         print("=" * 80)
         if result.unchanged:
             print("\nBranches (both remotes match):")
@@ -549,7 +553,7 @@ Examples:
     remote_to_remote_result = None
     if args.second_remote:
         second_remote_name = args.second_remote
-        
+
         # Validate second remote exists
         try:
             cmd = ["git", "remote", "get-url", second_remote_name]
@@ -570,7 +574,9 @@ Examples:
             sys.exit(1)
 
         # Get branch hashes for both remotes and compare
-        print(f"\nChecking remote '{remote_name}' against remote '{second_remote_name}'...")
+        print(
+            f"\nChecking remote '{remote_name}' against remote '{second_remote_name}'..."
+        )
         remote_branches = get_all_branch_hashes_two_remotes(
             workspace_dir, remote_name, second_remote_name, limit_branches
         )
@@ -587,19 +593,24 @@ Examples:
     print("env.git.remoteBranchesJson: \n", result.to_dict())
     if remote_to_remote_result:
         print("env.git.remoteToRemoteChanged: \n", remote_to_remote_result.changed)
-        print("env.git.remoteToRemoteBranchesJson: \n", remote_to_remote_result.to_dict())
+        print(
+            "env.git.remoteToRemoteBranchesJson: \n", remote_to_remote_result.to_dict()
+        )
 
     # Optional TeamCity hints
     if True:
         # change_detected: true if any branch has changed on remote
-        change_detected = bool(result.changed or (remote_to_remote_result and remote_to_remote_result.changed))
+        change_detected = bool(
+            result.changed
+            or (remote_to_remote_result and remote_to_remote_result.changed)
+        )
         if args.hint_teamcity:
             set_teamcity_parameter(
                 "env.git.remoteChanged", "true" if change_detected else "false"
             )
 
         merged_dict = deep_merge(result.to_dict(), remote_to_remote_result.to_dict())
-        
+
         result_json = json.dumps(merged_dict, ensure_ascii=False)
         print("result_json: \n", result_json)
         if args.hint_teamcity:
@@ -607,9 +618,11 @@ Examples:
             # Encode JSON as Base64URL so it can be safely passed through HTTP/CLI parameters
             import base64
 
-            encoded_json = base64.urlsafe_b64encode(
-                result_json.encode("utf-8")
-            ).decode("ascii").rstrip("=")
+            encoded_json = (
+                base64.urlsafe_b64encode(result_json.encode("utf-8"))
+                .decode("ascii")
+                .rstrip("=")
+            )
             set_teamcity_parameter("env.git.remoteBranchesJson", encoded_json)
 
             print("encoded_json: \n", encoded_json)

@@ -279,6 +279,68 @@ def validate_branch_exists(workspace_dir, remote_name, branch_name):
         sys.exit(1)
 
 
+def validate_local_branch_exists(workspace_dir, branch_name, source_remote="origin"):
+    """Validate that a local branch exists for the specified branch name.
+
+    This is required for LFS fetch operations which need a local branch reference.
+    After validation, updates the local branch to point to the newest commit from the remote.
+
+    Args:
+        workspace_dir: Path to the git repository
+        branch_name: Name of the branch to validate
+        source_remote: Name of the source remote (default: origin)
+    """
+    ref = f"refs/heads/{branch_name}"
+    cmd = ["git", "show-ref", "--quiet", "--verify", ref]
+    result = run_command(cmd, cwd=workspace_dir)
+
+    if result != 0:
+        print(
+            f"Error: Local branch '{branch_name}' not found in refs/heads/{branch_name}"
+        )
+        print("LFS fetch requires a local branch to work properly.")
+        print(f"\nTo create a local branch tracking {branch_name}, run:")
+        print(f"  git branch {branch_name} {source_remote}/{branch_name}")
+        print(f"\nOr if the remote branch exists:")
+        print(f"  git checkout -b {branch_name} {source_remote}/{branch_name}")
+        print("\nAvailable local branches:")
+        run_command(["git", "branch"], cwd=workspace_dir, logger=_global_cmd_logger)
+        sys.exit(1)
+
+    # Update local branch to point to the newest commit from the source remote
+    remote_ref = f"refs/remotes/{source_remote}/{branch_name}"
+    print(
+        f"Updating local branch '{branch_name}' to match {source_remote}/{branch_name}..."
+    )
+
+    # Get the commit hash from the remote branch
+    try:
+        remote_commit = run_command_and_get_return_info(
+            ["git", "rev-parse", remote_ref], cwd=workspace_dir, shell=False
+        )
+        remote_commit = remote_commit.strip()
+
+        # Update the local branch to point to the remote commit
+        update_result = run_command(
+            ["git", "update-ref", ref, remote_ref],
+            cwd=workspace_dir,
+            logger=_global_cmd_logger,
+        )
+
+        if update_result == 0:
+            print(f"Local branch '{branch_name}' updated to {remote_commit[:8]}...")
+        else:
+            print(
+                f"Warning: Failed to update local branch '{branch_name}' to match remote"
+            )
+            # Continue anyway - the branch exists, just might not be up to date
+    except subprocess.CalledProcessError as e:
+        print(
+            f"Warning: Failed to get remote commit for {source_remote}/{branch_name}: {e}"
+        )
+        # Continue anyway - the branch exists, just might not be up to date
+
+
 def filter_valid_commits(lines: list[str], debug_mode: bool) -> list[CommitInfo]:
     """Filter out commits that are not valid."""
     # Parse lines to extract commit hash and message, and create CommitInfo objects
@@ -942,14 +1004,19 @@ def main():
     remote_url = validate_remote(ctx.workspace_dir, ctx.dest_remote)
     print(f"Remote URL: {sanitize_remote_url(remote_url)}")
 
-    # Fetch latest state from destination remote
+    # Fetch latest state from both source and destination remotes
     print(
         f"Fetching latest remote state from {ctx.source_remote} and {ctx.dest_remote}..."
     )
-    # Don't automatically fetch the source remote, you need to fetch it manually or with other scripts
-    # run_command(["git", "fetch", "--force", ctx.source_remote], cwd=ctx.workspace_dir, logger=ctx.cmd_logger)
     # git fetch outputs info to stderr, so use stderr_to_stdout=True to treat it as normal output
     # error_regex will catch actual error messages
+    run_command(
+        ["git", "fetch", "--force", ctx.source_remote],
+        cwd=ctx.workspace_dir,
+        logger=ctx.cmd_logger,
+        stderr_to_stdout=True,
+        error_regex=".*error.*",
+    )
     run_command(
         ["git", "fetch", "--force", ctx.dest_remote],
         cwd=ctx.workspace_dir,
@@ -958,14 +1025,34 @@ def main():
         error_regex=".*error.*",
     )
 
-    # Validate branches exist
+    # Validate branches exist on remotes
     validate_branch_exists(ctx.workspace_dir, ctx.source_remote, ctx.branch)
     validate_branch_exists(ctx.workspace_dir, ctx.dest_remote, ctx.branch)
+
+    # Validate local branch exists (required for LFS fetch) and update it to match remote
+    validate_local_branch_exists(ctx.workspace_dir, ctx.branch, ctx.source_remote)
 
     # Check if LFS is enabled and store in context
     ctx.is_using_lfs = is_lfs_enabled(ctx.workspace_dir)
     if ctx.is_using_lfs:
         print("Git LFS detected - will fetch LFS objects for each batch before pushing")
+        # Fetch LFS objects from both remotes
+        print(f"Fetching LFS objects from {ctx.source_remote}...")
+        run_command(
+            ["git", "lfs", "fetch", ctx.source_remote, ctx.branch],
+            cwd=ctx.workspace_dir,
+            logger=ctx.cmd_logger,
+            stderr_to_stdout=True,
+            error_regex=".*error.*",
+        )
+        print(f"Fetching LFS objects from {ctx.dest_remote}...")
+        run_command(
+            ["git", "lfs", "fetch", ctx.dest_remote, ctx.branch],
+            cwd=ctx.workspace_dir,
+            logger=ctx.cmd_logger,
+            stderr_to_stdout=True,
+            error_regex=".*error.*",
+        )
     else:
         print("Git LFS not detected - skipping LFS operations")
 
@@ -1075,6 +1162,17 @@ def main():
                 stderr_to_stdout=True,
                 error_regex=".*error.*",
             )
+
+            # Also fetch LFS objects if LFS is enabled
+            if ctx.is_using_lfs:
+                print(f"Fetching LFS objects from {ctx.dest_remote}...")
+                run_command(
+                    ["git", "lfs", "fetch", ctx.dest_remote, ctx.branch],
+                    cwd=ctx.workspace_dir,
+                    logger=ctx.cmd_logger,
+                    stderr_to_stdout=True,
+                    error_regex=".*error.*",
+                )
 
             # Verification: compare logs after each batch
             if not verify_logs(ctx):

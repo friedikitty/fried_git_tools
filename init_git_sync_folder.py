@@ -107,12 +107,314 @@ def ask_yesno(ui_callback, message):
             print("Please enter 'y' or 'n'.")
 
 
-def init_bare_repository(repo_path, ui_callback=None):
+def init_repository(repo_path, bare=True, ui_callback=None):
     """
-    Initialize a bare Git repository.
+    Initialize a Git repository (bare or non-bare).
 
     Args:
-        repo_path: Path where the bare repository should be created
+        repo_path: Path where the repository should be created
+        bare: If True, create a bare repository; if False, create a regular repository
+        ui_callback: Optional UI callback object for user interactions
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    repo_type = "bare" if bare else "regular"
+    hint(
+        ui_callback,
+        "info",
+        f"\n{'='*80}\nInitializing {repo_type} repository at: {repo_path}\n{'='*80}\n",
+    )
+
+    # Create directory if it doesn't exist
+    repo_path_obj = Path(repo_path)
+    repo_path_obj.mkdir(parents=True, exist_ok=True)
+
+    # Check if already initialized
+    if bare:
+        check_path = repo_path_obj / "HEAD"
+    else:
+        check_path = repo_path_obj / ".git" / "HEAD"
+
+    if check_path.exists():
+        hint(ui_callback, "warning", f"Repository already exists at {repo_path}")
+        if not ask_yesno(ui_callback, "Continue with existing repository?"):
+            hint(ui_callback, "info", "Aborted by user")
+            return False
+        hint(ui_callback, "success", "Using existing repository")
+        return True
+
+    # Initialize repository
+    if bare:
+        result = run_command("git init --bare", cwd=repo_path)
+    else:
+        result = run_command("git init", cwd=repo_path)
+
+    if result == 0:
+        hint(
+            ui_callback,
+            "success",
+            f"{repo_type.capitalize()} repository initialized at {repo_path}",
+        )
+        return True
+    else:
+        hint(ui_callback, "error", "Failed to initialize repository")
+        return False
+
+
+def init_git_lfs(repo_path, ui_callback=None):
+    """
+    Initialize Git LFS for the bare repository (if available).
+
+    This ensures LFS configuration is present so that LFS objects can be
+    fetched/pushed correctly when this bare repo is used as a mirror.
+
+    Args:
+        repo_path: Path to the (bare) repository
+        ui_callback: Optional UI callback object for user interactions
+
+    Returns:
+        bool: True if LFS is initialized or not needed, False if initialization failed
+    """
+    hint(
+        ui_callback,
+        "info",
+        f"\n{'='*80}\nInitializing Git LFS in repository\n{'='*80}\n",
+    )
+
+    # First, check if git-lfs is installed
+    check_cmd = "git lfs version"
+    result = run_command(check_cmd, cwd=repo_path)
+    if result != 0:
+        hint(
+            ui_callback,
+            "warning",
+            "Git LFS does not appear to be installed or available in PATH. "
+            "Skipping LFS initialization.",
+        )
+        return False
+
+    # Initialize LFS configuration in this repo (local only, no global changes)
+    init_cmd = "git lfs install --local"
+    result = run_command(init_cmd, cwd=repo_path)
+
+    if result == 0:
+        hint(ui_callback, "success", "Git LFS initialized for this repository")
+        return True
+
+    hint(
+        ui_callback,
+        "warning",
+        "Failed to initialize Git LFS for this repository. LFS objects may not sync correctly.",
+    )
+    return False
+
+
+def create_default_gitignore(repo_path, ui_callback=None):
+    """
+    Create a default .gitignore file and add it to the repository.
+
+    Args:
+        repo_path: Path to the (bare) repository
+        ui_callback: Optional UI callback object for user interactions
+
+    Returns:
+        str: Blob hash of the created file, or None if failed
+    """
+    default_gitignore = """# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-*
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.bak
+*.swp
+*~
+
+# User-specific files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Build artifacts
+*.o
+*.obj
+*.exe
+*.dll
+*.lib
+*.a
+*.so
+*.dylib
+"""
+
+    try:
+        import subprocess
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(mode="wb", delete=False) as f:
+            f.write(default_gitignore.encode("utf-8"))
+            temp_path = f.name
+
+        try:
+            # Use git hash-object to create the blob
+            with open(temp_path, "rb") as f:
+                proc = subprocess.Popen(
+                    ["git", "hash-object", "-w", "--stdin"],
+                    cwd=repo_path,
+                    stdin=f,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                stdout, stderr = proc.communicate()
+                if proc.returncode == 0:
+                    blob_hash = stdout.decode("utf-8").strip()
+                    hint(ui_callback, "success", f"Created default .gitignore file")
+                    return blob_hash
+                else:
+                    hint(
+                        ui_callback,
+                        "warning",
+                        f"Failed to create .gitignore blob: {stderr.decode('utf-8', errors='replace')}",
+                    )
+                    return None
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+    except Exception as e:
+        hint(ui_callback, "warning", f"Failed to create .gitignore: {str(e)}")
+        return None
+
+
+def create_default_gitattributes(repo_path, ui_callback=None):
+    """
+    Create a default .gitattributes file for Git LFS and add it to the repository.
+
+    Args:
+        repo_path: Path to the (bare) repository
+        ui_callback: Optional UI callback object for user interactions
+
+    Returns:
+        str: Blob hash of the created file, or None if failed
+    """
+    default_gitattributes = """# Git LFS attributes
+# Common binary and large file patterns
+
+# Images
+*.png filter=lfs diff=lfs merge=lfs -text
+*.jpg filter=lfs diff=lfs merge=lfs -text
+*.jpeg filter=lfs diff=lfs merge=lfs -text
+*.gif filter=lfs diff=lfs merge=lfs -text
+*.bmp filter=lfs diff=lfs merge=lfs -text
+*.tiff filter=lfs diff=lfs merge=lfs -text
+*.ico filter=lfs diff=lfs merge=lfs -text
+*.psd filter=lfs diff=lfs merge=lfs -text
+
+# Audio/Video
+*.mp3 filter=lfs diff=lfs merge=lfs -text
+*.mp4 filter=lfs diff=lfs merge=lfs -text
+*.avi filter=lfs diff=lfs merge=lfs -text
+*.mov filter=lfs diff=lfs merge=lfs -text
+*.wav filter=lfs diff=lfs merge=lfs -text
+*.flv filter=lfs diff=lfs merge=lfs -text
+
+# Archives
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.tar filter=lfs diff=lfs merge=lfs -text
+*.gz filter=lfs diff=lfs merge=lfs -text
+*.7z filter=lfs diff=lfs merge=lfs -text
+*.rar filter=lfs diff=lfs merge=lfs -text
+
+# Binaries
+*.exe filter=lfs diff=lfs merge=lfs -text
+*.dll filter=lfs diff=lfs merge=lfs -text
+*.so filter=lfs diff=lfs merge=lfs -text
+*.dylib filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+
+# Large data files
+*.db filter=lfs diff=lfs merge=lfs -text
+*.sqlite filter=lfs diff=lfs merge=lfs -text
+*.dump filter=lfs diff=lfs merge=lfs -text
+"""
+
+    try:
+        import subprocess
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(mode="wb", delete=False) as f:
+            f.write(default_gitattributes.encode("utf-8"))
+            temp_path = f.name
+
+        try:
+            # Use git hash-object to create the blob
+            with open(temp_path, "rb") as f:
+                proc = subprocess.Popen(
+                    ["git", "hash-object", "-w", "--stdin"],
+                    cwd=repo_path,
+                    stdin=f,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                stdout, stderr = proc.communicate()
+                if proc.returncode == 0:
+                    blob_hash = stdout.decode("utf-8").strip()
+                    hint(ui_callback, "success", f"Created default .gitattributes file")
+                    return blob_hash
+                else:
+                    hint(
+                        ui_callback,
+                        "warning",
+                        f"Failed to create .gitattributes blob: {stderr.decode('utf-8', errors='replace')}",
+                    )
+                    return None
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+    except Exception as e:
+        hint(ui_callback, "warning", f"Failed to create .gitattributes: {str(e)}")
+        return None
+
+
+def add_default_files_to_repository(
+    repo_path,
+    default_branch,
+    create_gitignore=True,
+    create_gitattributes=True,
+    ui_callback=None,
+):
+    """
+    Create default .gitignore and .gitattributes files in a non-bare repository.
+    The files are created in the working directory but NOT committed.
+
+    Args:
+        repo_path: Path to the repository (must be non-bare)
+        default_branch: Branch name (for reference)
+        create_gitignore: Whether to create .gitignore
+        create_gitattributes: Whether to create .gitattributes
         ui_callback: Optional UI callback object for user interactions
 
     Returns:
@@ -121,31 +423,134 @@ def init_bare_repository(repo_path, ui_callback=None):
     hint(
         ui_callback,
         "info",
-        f"\n{'='*80}\nInitializing bare repository at: {repo_path}\n{'='*80}\n",
+        f"\n{'='*80}\nCreating default files in repository (not committing)\n{'='*80}\n",
     )
 
-    # Create directory if it doesn't exist
-    repo_path_obj = Path(repo_path)
-    repo_path_obj.mkdir(parents=True, exist_ok=True)
+    success = True
 
-    # Check if already initialized
-    if (repo_path_obj / "HEAD").exists():
-        hint(ui_callback, "warning", f"Repository already exists at {repo_path}")
-        if not ask_yesno(ui_callback, "Continue with existing repository?"):
-            hint(ui_callback, "info", "Aborted by user")
-            return False
-        hint(ui_callback, "success", "Using existing repository")
-        return True
+    # Create .gitignore file if requested
+    if create_gitignore:
+        default_gitignore = """# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
 
-    # Initialize bare repository
-    result = run_command("git init --bare", cwd=repo_path)
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-*
 
-    if result == 0:
-        hint(ui_callback, "success", f"Bare repository initialized at {repo_path}")
-        return True
-    else:
-        hint(ui_callback, "error", "Failed to initialize repository")
-        return False
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.bak
+*.swp
+*~
+
+# User-specific files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Build artifacts
+*.o
+*.obj
+*.exe
+*.dll
+*.lib
+*.a
+*.so
+*.dylib
+"""
+        gitignore_path = os.path.join(repo_path, ".gitignore")
+        try:
+            with open(gitignore_path, "w", encoding="utf-8") as f:
+                f.write(default_gitignore)
+            hint(ui_callback, "success", "Created .gitignore file")
+        except Exception as e:
+            hint(ui_callback, "warning", f"Failed to create .gitignore: {str(e)}")
+            success = False
+
+    # Create .gitattributes file if requested
+    if create_gitattributes:
+        default_gitattributes = """# Git LFS attributes
+# Common binary and large file patterns
+
+# Images
+*.png filter=lfs diff=lfs merge=lfs -text
+*.jpg filter=lfs diff=lfs merge=lfs -text
+*.jpeg filter=lfs diff=lfs merge=lfs -text
+*.gif filter=lfs diff=lfs merge=lfs -text
+*.bmp filter=lfs diff=lfs merge=lfs -text
+*.tiff filter=lfs diff=lfs merge=lfs -text
+*.ico filter=lfs diff=lfs merge=lfs -text
+*.psd filter=lfs diff=lfs merge=lfs -text
+
+# Audio/Video
+*.mp3 filter=lfs diff=lfs merge=lfs -text
+*.mp4 filter=lfs diff=lfs merge=lfs -text
+*.avi filter=lfs diff=lfs merge=lfs -text
+*.mov filter=lfs diff=lfs merge=lfs -text
+*.wav filter=lfs diff=lfs merge=lfs -text
+*.flv filter=lfs diff=lfs merge=lfs -text
+
+# Archives
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.tar filter=lfs diff=lfs merge=lfs -text
+*.gz filter=lfs diff=lfs merge=lfs -text
+*.7z filter=lfs diff=lfs merge=lfs -text
+*.rar filter=lfs diff=lfs merge=lfs -text
+
+# Binaries
+*.exe filter=lfs diff=lfs merge=lfs -text
+*.dll filter=lfs diff=lfs merge=lfs -text
+*.so filter=lfs diff=lfs merge=lfs -text
+*.dylib filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+
+# Large data files
+*.db filter=lfs diff=lfs merge=lfs -text
+*.sqlite filter=lfs diff=lfs merge=lfs -text
+*.dump filter=lfs diff=lfs merge=lfs -text
+"""
+        gitattributes_path = os.path.join(repo_path, ".gitattributes")
+        try:
+            with open(gitattributes_path, "w", encoding="utf-8") as f:
+                f.write(default_gitattributes)
+            hint(ui_callback, "success", "Created .gitattributes file")
+        except Exception as e:
+            hint(ui_callback, "warning", f"Failed to create .gitattributes: {str(e)}")
+            success = False
+
+    if success:
+        hint(
+            ui_callback,
+            "info",
+            "\nNote: Default files have been created in the working directory. "
+            "They are not automatically committed. "
+            "You can add them to your next commit using:\n"
+            "  git add .gitignore .gitattributes\n"
+            "  git commit -m 'Add default files'\n",
+        )
+
+    return success
 
 
 def configure_remote(repo_path, remote_name, remote_url, ui_callback=None):
@@ -257,6 +662,69 @@ def configure_branch_fetch(
     return success
 
 
+def validate_branches_on_remote(repo_path, remote_name, branches, ui_callback=None):
+    """
+    Validate that the specified branches exist on the remote before proceeding.
+
+    Args:
+        repo_path: Path to the repository
+        remote_name: Name of the remote to check
+        branches: List of branch names to validate
+        ui_callback: Optional UI callback object for user interactions
+
+    Returns:
+        bool: True if all branches exist, False otherwise
+    """
+    hint(
+        ui_callback,
+        "info",
+        f"\n{'='*80}\nValidating branches on remote: {remote_name}\n{'='*80}\n",
+    )
+
+    missing_branches = []
+    for branch in branches:
+        # Use ls-remote to check if branch exists on remote
+        capture_logger = OutputCaptureLogger(None)
+        result = run_command(
+            f"git ls-remote --heads {remote_name} {branch}",
+            cwd=repo_path,
+            logger=capture_logger,
+        )
+
+        if result != 0:
+            missing_branches.append(branch)
+            hint(
+                ui_callback,
+                "error",
+                f"Branch '{branch}' not found on remote '{remote_name}'",
+            )
+        else:
+            output = capture_logger.get_output().strip()
+            if not output:
+                missing_branches.append(branch)
+                hint(
+                    ui_callback,
+                    "error",
+                    f"Branch '{branch}' not found on remote '{remote_name}'",
+                )
+            else:
+                hint(
+                    ui_callback,
+                    "success",
+                    f"Branch '{branch}' found on remote '{remote_name}'",
+                )
+
+    if missing_branches:
+        hint(
+            ui_callback,
+            "error",
+            f"Missing branches on '{remote_name}': {', '.join(missing_branches)}",
+        )
+        return False
+
+    return True
+
+
 def fetch_from_remote(repo_path, remote_name, ui_callback=None):
     """
     Fetch branches from the configured remote.
@@ -283,6 +751,148 @@ def fetch_from_remote(repo_path, remote_name, ui_callback=None):
     else:
         hint(ui_callback, "error", f"Failed to fetch from '{remote_name}'")
         return False
+
+
+def create_local_branches_from_remote(
+    repo_path, remote_name, default_branch=None, ui_callback=None
+):
+    """
+    Create local branches for all remote branches from the specified remote.
+    Also sets HEAD to point to the default_branch if provided.
+
+    Args:
+        repo_path: Path to the repository
+        remote_name: Name of the remote (e.g., 'origin')
+        default_branch: Branch name to set as HEAD (first branch in branches list)
+        ui_callback: Optional UI callback object for user interactions
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    hint(
+        ui_callback,
+        "info",
+        f"\n{'='*80}\nCreating local branches from remote: {remote_name}\n{'='*80}\n",
+    )
+
+    # Get list of remote branches
+    capture_logger = OutputCaptureLogger(None)
+    result = run_command(f"git branch -r", cwd=repo_path, logger=capture_logger)
+
+    if result != 0:
+        hint(ui_callback, "error", "Failed to list remote branches")
+        return False
+
+    output = capture_logger.get_output().strip()
+    if not output:
+        hint(
+            ui_callback,
+            "warning",
+            "No remote branches found. Skipping branch creation.",
+        )
+        return True
+
+    # Parse remote branches for the specified remote
+    remote_branches = []
+    for line in output.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        # Remove leading * if present (current branch indicator)
+        line = line.lstrip("*").strip()
+        # Handle "HEAD -> branch" format (e.g., "origin/HEAD -> origin/master")
+        if " -> " in line:
+            # Skip HEAD symbolic refs
+            continue
+        # Format: origin/branch-name or remotes/origin/branch-name
+        if line.startswith(f"{remote_name}/"):
+            branch_name = line.replace(f"{remote_name}/", "").strip()
+            if branch_name and branch_name != "HEAD":
+                remote_branches.append(branch_name)
+        elif line.startswith(f"remotes/{remote_name}/"):
+            branch_name = line.replace(f"remotes/{remote_name}/", "").strip()
+            if branch_name and branch_name != "HEAD":
+                remote_branches.append(branch_name)
+
+    if not remote_branches:
+        hint(ui_callback, "warning", f"No branches found for remote '{remote_name}'")
+        return True
+
+    hint(
+        ui_callback,
+        "info",
+        f"Found {len(remote_branches)} remote branch(es) to create locally",
+    )
+
+    # Create local branches for each remote branch
+    success_count = 0
+    for branch_name in remote_branches:
+        remote_ref = f"refs/remotes/{remote_name}/{branch_name}"
+        local_ref = f"refs/heads/{branch_name}"
+
+        # Check if local branch already exists
+        check_cmd = f"git show-ref --verify --quiet {local_ref}"
+        check_result = run_command(check_cmd, cwd=repo_path)
+
+        if check_result == 0:
+            hint(
+                ui_callback,
+                "info",
+                f"Local branch '{branch_name}' already exists, skipping",
+            )
+            success_count += 1
+            continue
+
+        # Create local branch pointing to the remote branch
+        # In bare repo, we use: git branch <branch-name> <remote-ref>
+        create_cmd = f"git branch {branch_name} {remote_ref}"
+        create_result = run_command(create_cmd, cwd=repo_path)
+
+        if create_result == 0:
+            hint(
+                ui_callback,
+                "success",
+                f"Created local branch '{branch_name}' from {remote_name}/{branch_name}",
+            )
+            success_count += 1
+        else:
+            hint(
+                ui_callback, "warning", f"Failed to create local branch '{branch_name}'"
+            )
+
+    hint(
+        ui_callback,
+        "info",
+        f"Created {success_count}/{len(remote_branches)} local branch(es)",
+    )
+
+    # Set HEAD to the default branch if provided
+    if default_branch:
+        # Check if the default branch exists locally
+        check_cmd = f"git show-ref --verify --quiet refs/heads/{default_branch}"
+        check_result = run_command(check_cmd, cwd=repo_path)
+
+        if check_result == 0:
+            # Set HEAD to point to the default branch
+            set_head_cmd = f"git symbolic-ref HEAD refs/heads/{default_branch}"
+            head_result = run_command(set_head_cmd, cwd=repo_path)
+
+            if head_result == 0:
+                hint(ui_callback, "success", f"Set HEAD to branch '{default_branch}'")
+            else:
+                hint(
+                    ui_callback,
+                    "warning",
+                    f"Failed to set HEAD to branch '{default_branch}'",
+                )
+        else:
+            hint(
+                ui_callback,
+                "warning",
+                f"Default branch '{default_branch}' does not exist locally. Cannot set HEAD.",
+            )
+
+    return success_count > 0
 
 
 def verify_configuration(
@@ -470,6 +1080,25 @@ def argument_pars(parser, use_gooey=False):
         help="Name of the destination remote (default: destination)",
     )
 
+    parser.add_argument(
+        "--no-default-ignore",
+        action="store_true",
+        help="Skip creating default .gitignore file",
+    )
+
+    parser.add_argument(
+        "--no-default-lfs",
+        action="store_true",
+        help="Skip creating default .gitattributes file for LFS",
+    )
+
+    parser.add_argument(
+        "--bare",
+        action="store_true",
+        default=True,
+        help="Create a bare repository (default: True)",
+    )
+
     return parser.parse_args()
 
 
@@ -516,8 +1145,10 @@ def main_core(args, ui_callback=None):
             f"  Destination Remote Name: {args.destination_remote_name}\n"
             f"  Destination Remote URL:  {sanitize_remote_url(args.destination_remote_url)}\n"
         )
+    is_bare = getattr(args, "bare", True)
     config_msg += (
         f"  Branches:        {', '.join(args.branches)}\n"
+        f"  Repository Type: {'Bare' if is_bare else 'Regular (non-bare)'}\n"
         f"  Fetch After:     {'No' if args.no_fetch else 'Yes'}\n"
         f"  Mode:            {'Verify Only' if args.verify_only else 'Initialize'}\n"
         f"{'='*80}\n"
@@ -552,10 +1183,22 @@ def main_core(args, ui_callback=None):
         os.makedirs(repo_path)
         hint(ui_callback, "success", f"Repository path '{repo_path}' created")
 
-    # Step 1: Initialize bare repository
-    if not init_bare_repository(repo_path, ui_callback):
+    # Step 1: Initialize repository (bare or non-bare)
+    is_bare = getattr(args, "bare", True)  # Default to True for backward compatibility
+    if not init_repository(repo_path, bare=is_bare, ui_callback=ui_callback):
         hint(ui_callback, "error", "\nFailed to initialize repository")
         return 1
+
+    # Step 1.1: Initialize Git LFS for this repository (best-effort)
+    # Do not hard-fail on LFS; just warn if it is missing or fails.
+    if not init_git_lfs(repo_path, ui_callback):
+        hint(
+            ui_callback,
+            "warning",
+            "Git LFS was not initialized successfully. "
+            "If this repository needs to mirror LFS content, please ensure "
+            "git-lfs is installed and re-run initialization.",
+        )
 
     # Step 2: Configure remote
     if not configure_remote(repo_path, args.remote_name, args.remote_url, ui_callback):
@@ -586,12 +1229,62 @@ def main_core(args, ui_callback=None):
                 "\nFailed to configure destination remote, but continuing...",
             )
 
-    # Step 4: Fetch from remote (if not skipped)
+    # Step 3.6: Validate branches exist on remotes before fetching
     if not args.no_fetch:
-        if not fetch_from_remote(repo_path, "--all", ui_callback):
+        hint(
+            ui_callback,
+            "info",
+            "\nValidating that specified branches exist on remotes...",
+        )
+        # Validate branches on source remote
+        if not validate_branches_on_remote(
+            repo_path, args.remote_name, args.branches, ui_callback
+        ):
             hint(
-                ui_callback, "warning", "\nFetch failed, but configuration is complete"
+                ui_callback,
+                "error",
+                f"\nValidation failed: Some branches are missing on '{args.remote_name}'. Aborting.",
             )
+            return 1
+
+        # Validate branches on destination remote (if provided)
+        if args.destination_remote_url:
+            if not validate_branches_on_remote(
+                repo_path,
+                args.destination_remote_name,
+                args.branches,
+                ui_callback,
+            ):
+                hint(
+                    ui_callback,
+                    "error",
+                    f"\nValidation failed: Some branches are missing on '{args.destination_remote_name}'. Aborting.",
+                )
+                return 1
+
+    # Step 4: Fetch from remote (if not skipped)
+    # Fetch one by one, stop on failure
+    if not args.no_fetch:
+        # Fetch from source remote first
+        if not fetch_from_remote(repo_path, args.remote_name, ui_callback):
+            hint(
+                ui_callback,
+                "error",
+                f"\nFailed to fetch from '{args.remote_name}'. Aborting.",
+            )
+            return 1
+
+        # Fetch from destination remote (if provided)
+        if args.destination_remote_url:
+            if not fetch_from_remote(
+                repo_path, args.destination_remote_name, ui_callback
+            ):
+                hint(
+                    ui_callback,
+                    "error",
+                    f"\nFailed to fetch from '{args.destination_remote_name}'. Aborting.",
+                )
+                return 1
     else:
         hint(ui_callback, "warning", "\nSkipping fetch (--no-fetch specified)")
 
@@ -603,6 +1296,160 @@ def main_core(args, ui_callback=None):
         args.destination_remote_name if args.destination_remote_url else None,
         ui_callback,
     )
+
+    # Step 6: Create local branches from remote branches and set HEAD
+    if not args.no_fetch:
+        # Create local branches first, then determine default branch
+        if not create_local_branches_from_remote(
+            repo_path, args.remote_name, None, ui_callback
+        ):
+            hint(
+                ui_callback,
+                "warning",
+                "\nSome local branches may not have been created, but continuing...",
+            )
+
+        # Determine default branch: prefer master, then main, then first branch with confirmation
+        default_branch = None
+        if args.branches:
+            has_master = "master" in args.branches
+            has_main = "main" in args.branches
+
+            # Check if both master and main exist - this is an error
+            if has_master and has_main:
+                hint(
+                    ui_callback,
+                    "error",
+                    "Both 'master' and 'main' are specified in branches list. "
+                    "Please specify only one default branch.",
+                )
+                return 1
+
+            # Prefer master, then main
+            if has_master:
+                candidate_branch = "master"
+            elif has_main:
+                candidate_branch = "main"
+            else:
+                # Use first branch, but ask for confirmation
+                candidate_branch = args.branches[0]
+                confirmation_msg = (
+                    f"\nNeither 'master' nor 'main' found in branches list. "
+                    f"Will use '{candidate_branch}' as default branch.\n"
+                    f"Proceed with '{candidate_branch}' as the default branch?"
+                )
+                if not ask_yesno(ui_callback, confirmation_msg):
+                    hint(ui_callback, "info", "\nAborted by user")
+                    return 1
+
+            # Verify the candidate branch exists locally
+            check_cmd = f"git show-ref --verify --quiet refs/heads/{candidate_branch}"
+            check_result = run_command(check_cmd, cwd=repo_path)
+            if check_result == 0:
+                default_branch = candidate_branch
+            else:
+                # Try to find the branch from remote branches
+                capture_logger = OutputCaptureLogger(None)
+                result = run_command(
+                    f"git branch -r", cwd=repo_path, logger=capture_logger
+                )
+                if result == 0:
+                    output = capture_logger.get_output().strip()
+                    found_branch = False
+                    for line in output.split("\n"):
+                        line = line.strip().lstrip("*").strip()
+                        if " -> " in line:
+                            continue
+                        if line.startswith(f"{args.remote_name}/"):
+                            branch_name = line.replace(
+                                f"{args.remote_name}/", ""
+                            ).strip()
+                            if (
+                                branch_name == candidate_branch
+                                and branch_name != "HEAD"
+                            ):
+                                # Check if this branch exists locally
+                                check_cmd = f"git show-ref --verify --quiet refs/heads/{branch_name}"
+                                if run_command(check_cmd, cwd=repo_path) == 0:
+                                    default_branch = branch_name
+                                    found_branch = True
+                                    break
+
+                    if not found_branch:
+                        hint(
+                            ui_callback,
+                            "warning",
+                            f"Default branch '{candidate_branch}' not found locally. "
+                            f"Will try to use first available branch.",
+                        )
+                        # Fallback: use first available branch from remote
+                        for line in output.split("\n"):
+                            line = line.strip().lstrip("*").strip()
+                            if " -> " in line:
+                                continue
+                            if line.startswith(f"{args.remote_name}/"):
+                                branch_name = line.replace(
+                                    f"{args.remote_name}/", ""
+                                ).strip()
+                                if branch_name and branch_name != "HEAD":
+                                    check_cmd = f"git show-ref --verify --quiet refs/heads/{branch_name}"
+                                    if run_command(check_cmd, cwd=repo_path) == 0:
+                                        default_branch = branch_name
+                                        hint(
+                                            ui_callback,
+                                            "info",
+                                            f"Using '{branch_name}' as default branch instead.",
+                                        )
+                                        break
+                else:
+                    hint(
+                        ui_callback,
+                        "warning",
+                        f"Default branch '{candidate_branch}' not found locally and could not list remote branches.",
+                    )
+
+        # Set HEAD to the default branch if we found one
+        if default_branch:
+            set_head_cmd = f"git symbolic-ref HEAD refs/heads/{default_branch}"
+            head_result = run_command(set_head_cmd, cwd=repo_path)
+            if head_result == 0:
+                hint(ui_callback, "success", f"Set HEAD to branch '{default_branch}'")
+            else:
+                hint(
+                    ui_callback,
+                    "warning",
+                    f"Failed to set HEAD to branch '{default_branch}'",
+                )
+        else:
+            hint(
+                ui_callback,
+                "warning",
+                f"Could not determine default branch to set HEAD. First branch '{args.branches[0] if args.branches else 'N/A'}' does not exist locally.",
+            )
+
+        # Step 7: Add default .gitignore and .gitattributes files if requested
+        if default_branch and not is_bare:
+            # Check if we should create default files (default is True unless flags are set)
+            # argparse converts --no-default-ignore to no_default_ignore
+            no_default_ignore = getattr(args, "no_default_ignore", False)
+            no_default_lfs = getattr(args, "no_default_lfs", False)
+            create_gitignore = not no_default_ignore
+            create_gitattributes = not no_default_lfs
+
+            if create_gitignore or create_gitattributes:
+                add_default_files_to_repository(
+                    repo_path,
+                    default_branch,
+                    create_gitignore=create_gitignore,
+                    create_gitattributes=create_gitattributes,
+                    ui_callback=ui_callback,
+                )
+    else:
+        hint(
+            ui_callback,
+            "info",
+            "\nSkipping local branch creation (--no-fetch specified, no remote branches available)",
+        )
 
     # Summary
     summary_msg = (

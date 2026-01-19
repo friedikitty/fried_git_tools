@@ -127,6 +127,7 @@ def _run_command(
     timeout=300,
     stderr_to_stdout=False,
     error_regex=None,
+    env=None,
 ):
     """Modern command execution using subprocess.run with automatic text handling.
 
@@ -153,6 +154,7 @@ def _run_command(
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
+            env=env,
         )
 
         # Compile error regex if provided
@@ -195,11 +197,19 @@ def _run_command(
                             else:
                                 print(f"  | {line.strip()}")
                     else:
-                        # Default behavior: always treat stderr as error
-                        if logger:
-                            logger.error(line.strip())
+                        # Default behavior: treat stderr as error only if return code is not 0
+                        # If return code is 0, stderr is just informational (like git fetch output)
+                        if result.returncode != 0:
+                            if logger:
+                                logger.error(line.strip())
+                            else:
+                                print(f"  | ERROR: {line.strip()}")
                         else:
-                            print(f"  | ERROR: {line.strip()}")
+                            # Return code is 0, so stderr is informational
+                            if logger:
+                                logger.info(line.strip())
+                            else:
+                                print(f"  | {line.strip()}")
 
         print(f"Command completed with return code: {result.returncode}")
         if logger:
@@ -239,6 +249,7 @@ def run_command(
     timeout=300,
     stderr_to_stdout=False,
     error_regex=None,
+    env=None,
 ):
     """Run a command with real-time output.
 
@@ -249,11 +260,12 @@ def run_command(
     :param timeout: Timeout in seconds
     :param stderr_to_stdout: If True, treat stderr as stdout (merge streams)
     :param error_regex: Optional regex pattern to detect error lines (case-insensitive)
+    :param env: Optional environment variables dictionary
     :return: Return what the command return
     """
     try:
         return _run_command(
-            cmd, cwd, logger, shell, timeout, stderr_to_stdout, error_regex
+            cmd, cwd, logger, shell, timeout, stderr_to_stdout, error_regex, env
         )
     except Exception as e:
         if logger:

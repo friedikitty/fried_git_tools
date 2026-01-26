@@ -40,7 +40,11 @@
 #   2. Fetch the latest state from both origin and destination remotes
 #   3. Find commits in origin that are not in destination (origin..destination)
 #   4. Split commits into batches of BATCH_SIZE
-#   5. Push each batch from origin to destination remote in chronological order
+#   5. For each batch:
+#      a. Fetch LFS objects from origin (if LFS is enabled)
+#      b. Push LFS objects to destination FIRST (ensures remote consistency)
+#      c. Push commits to destination (after LFS objects are safely uploaded)
+#      d. Verify the push succeeded
 #   6. Use --force-with-lease for safe force pushing (if enabled)
 #
 # FORCE PUSH BEHAVIOR:
@@ -796,6 +800,7 @@ def fetch_lfs_objects_for_commit(ctx: Context, commit_sha: str) -> bool:
                 cwd=ctx.workspace_dir,
                 logger=ctx.cmd_logger,
                 stderr_to_stdout=True,
+                stream_output=True,
             )
 
             if lfs_result == 0:
@@ -1010,12 +1015,14 @@ def main():
     )
     # git fetch outputs info to stderr, so use stderr_to_stdout=True to treat it as normal output
     # error_regex will catch actual error messages
+    # git fetch can be painfully slow, use streaming output and no timeout
     run_command(
         ["git", "fetch", "--force", ctx.source_remote],
         cwd=ctx.workspace_dir,
         logger=ctx.cmd_logger,
         stderr_to_stdout=True,
         error_regex=".*error.*",
+        stream_output=True,
     )
     run_command(
         ["git", "fetch", "--force", ctx.dest_remote],
@@ -1023,6 +1030,7 @@ def main():
         logger=ctx.cmd_logger,
         stderr_to_stdout=True,
         error_regex=".*error.*",
+        stream_output=True,
     )
 
     # Validate branches exist on remotes
@@ -1044,6 +1052,7 @@ def main():
             logger=ctx.cmd_logger,
             stderr_to_stdout=True,
             error_regex=".*error.*",
+            stream_output=True,
         )
         print(f"Fetching LFS objects from {ctx.dest_remote}...")
         run_command(
@@ -1052,6 +1061,7 @@ def main():
             logger=ctx.cmd_logger,
             stderr_to_stdout=True,
             error_regex=".*error.*",
+            stream_output=True,
         )
     else:
         print("Git LFS not detected - skipping LFS operations")
@@ -1147,7 +1157,44 @@ def main():
 
             fetch_lfs_objects_for_batch(ctx, start_commit, target_commit, batch_num)
 
-        # Push this batch
+        # Push LFS objects BEFORE pushing commits (safer approach)
+        # This ensures remote always has LFS objects before commits that reference them
+        if ctx.is_using_lfs:
+            print(f"Pushing LFS objects to {ctx.dest_remote}...")
+            # Determine LFS push range
+            if i == 0:
+                # First batch: push all LFS objects from dest_head_hash to target_commit
+                lfs_push_range = f"{ctx.dest_head_hash}..{target_commit}"
+            else:
+                # Subsequent batches: push LFS objects from previous batch to current
+                prev_batch_end = ctx.commits[i - 1].hash
+                lfs_push_range = f"{prev_batch_end}..{target_commit}"
+
+            print(f"  LFS push range: {lfs_push_range}")
+            lfs_push_result = run_command(
+                ["git", "lfs", "push", ctx.dest_remote, lfs_push_range],
+                cwd=ctx.workspace_dir,
+                logger=ctx.cmd_logger,
+                stderr_to_stdout=True,
+                error_regex=".*error.*",
+                stream_output=True,
+            )
+
+            if lfs_push_result == 0:
+                print(
+                    f"[SUCCEEDED] LFS objects pushed successfully for batch {batch_num}"
+                )
+            else:
+                print(
+                    f"[FAILED] LFS push returned non-zero exit code {lfs_push_result}"
+                )
+                print(
+                    f"  Cannot proceed with commit push - LFS objects must be pushed first"
+                )
+                print(f"  This may indicate missing LFS objects or network issues")
+                sys.exit(1)
+
+        # Push this batch (commits and trees)
         if push_batch(ctx, target_commit, batch_num):
             print(f"[SUCCEEDED] Batch {batch_num} pushed successfully")
 
@@ -1155,12 +1202,14 @@ def main():
             print(f"Fetching from {ctx.dest_remote} to update local references...")
             # git fetch outputs info to stderr, so use stderr_to_stdout=True to treat it as normal output
             # error_regex will catch actual error messages
+            # git fetch can be painfully slow, use streaming output and no timeout
             run_command(
                 ["git", "fetch", "--force", ctx.dest_remote, ctx.branch],
                 cwd=ctx.workspace_dir,
                 logger=ctx.cmd_logger,
                 stderr_to_stdout=True,
                 error_regex=".*error.*",
+                stream_output=True,
             )
 
             # Also fetch LFS objects if LFS is enabled
@@ -1172,6 +1221,7 @@ def main():
                     logger=ctx.cmd_logger,
                     stderr_to_stdout=True,
                     error_regex=".*error.*",
+                    stream_output=True,
                 )
 
             # Verification: compare logs after each batch

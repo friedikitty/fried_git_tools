@@ -119,6 +119,259 @@ def _run_command_deprecated(cmd, cwd=None, logger=None, shell=False, timeout=300
         raise
 
 
+def _run_command_streaming(
+    cmd,
+    cwd=None,
+    logger=None,
+    shell=False,
+    stderr_to_stdout=False,
+    error_regex=None,
+    env=None,
+    encoding="utf-8",
+):
+    """Stream command output in real-time without buffering.
+
+    This implementation uses threading to continuously read stdout and stderr,
+    preventing blocking issues. Based on run_async_command.py.
+    No timeout is applied for long-running commands.
+
+    :param cmd: Command to execute (string or list)
+    :param cwd: Working directory
+    :param logger: Logger instance
+    :param shell: Whether to use shell
+    :param stderr_to_stdout: If True, merge stderr to stdout
+    :param error_regex: Optional regex pattern to detect error lines
+    :param env: Optional environment variables
+    :param encoding: Text encoding for output (default: utf-8)
+    :return: Return code
+    """
+    import re
+    import threading
+    from queue import Queue
+
+    try:
+        print(f"Running: {cmd if isinstance(cmd, str) else ' '.join(cmd)}")
+        if cwd:
+            print(f"  Working directory: {cwd}")
+
+        # Compile error regex if provided
+        error_pattern = None
+        if error_regex:
+            error_pattern = re.compile(error_regex, re.IGNORECASE)
+
+        # Use provided encoding or fallback to system encoding
+        output_encoding = encoding or sys.stdout.encoding or "utf-8"
+        error_encoding = encoding or sys.stderr.encoding or "utf-8"
+
+        # Create process with stdout/stderr as PIPE for reading
+        # Use unbuffered mode (bufsize=0) for real-time output
+        process = subprocess.Popen(
+            cmd,
+            shell=shell,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT if stderr_to_stdout else subprocess.PIPE,
+            env=env,
+            bufsize=0,  # Unbuffered for real-time output
+        )
+
+        # Queue for thread-safe output handling
+        output_queue = Queue()
+
+        def read_stdout():
+            """Thread function to continuously read stdout with support for progress updates."""
+            try:
+                buffer = b""
+                while True:
+                    # Read in small chunks for real-time output
+                    chunk = process.stdout.read(64)
+                    if chunk == b"" and process.poll() is not None:
+                        # Process ended, flush any remaining content
+                        if buffer:
+                            line = buffer.decode(
+                                output_encoding, errors="replace"
+                            ).rstrip()
+                            if line:
+                                output_queue.put(("stdout", line))
+                        break
+                    if chunk:
+                        buffer += chunk
+                        # Split on both \n and \r for progress updates
+                        while b"\n" in buffer or b"\r" in buffer:
+                            # Find the first occurrence of either \n or \r
+                            newline_pos = buffer.find(b"\n")
+                            carriage_pos = buffer.find(b"\r")
+
+                            if newline_pos == -1:
+                                split_pos = carriage_pos
+                                separator = b"\r"
+                            elif carriage_pos == -1:
+                                split_pos = newline_pos
+                                separator = b"\n"
+                            else:
+                                split_pos = min(newline_pos, carriage_pos)
+                                separator = b"\n" if split_pos == newline_pos else b"\r"
+
+                            line_bytes = buffer[:split_pos]
+                            buffer = buffer[split_pos + len(separator) :]
+
+                            line = line_bytes.decode(
+                                output_encoding, errors="replace"
+                            ).rstrip()
+                            if line:
+                                output_queue.put(("stdout", line, separator == b"\r"))
+            except Exception as e:
+                output_queue.put(("error", f"Error reading stdout: {e}", False))
+
+        def read_stderr():
+            """Thread function to continuously read stderr with support for progress updates."""
+            if stderr_to_stdout or process.stderr is None:
+                return
+            try:
+                buffer = b""
+                while True:
+                    # Read in small chunks for real-time output
+                    chunk = process.stderr.read(64)
+                    if chunk == b"" and process.poll() is not None:
+                        # Process ended, flush any remaining content
+                        if buffer:
+                            line = buffer.decode(
+                                error_encoding, errors="replace"
+                            ).rstrip()
+                            if line:
+                                output_queue.put(("stderr", line, False))
+                        break
+                    if chunk:
+                        buffer += chunk
+                        # Split on both \n and \r for progress updates
+                        while b"\n" in buffer or b"\r" in buffer:
+                            # Find the first occurrence of either \n or \r
+                            newline_pos = buffer.find(b"\n")
+                            carriage_pos = buffer.find(b"\r")
+
+                            if newline_pos == -1:
+                                split_pos = carriage_pos
+                                separator = b"\r"
+                            elif carriage_pos == -1:
+                                split_pos = newline_pos
+                                separator = b"\n"
+                            else:
+                                split_pos = min(newline_pos, carriage_pos)
+                                separator = b"\n" if split_pos == newline_pos else b"\r"
+
+                            line_bytes = buffer[:split_pos]
+                            buffer = buffer[split_pos + len(separator) :]
+
+                            line = line_bytes.decode(
+                                error_encoding, errors="replace"
+                            ).rstrip()
+                            if line:
+                                output_queue.put(("stderr", line, separator == b"\r"))
+            except Exception as e:
+                output_queue.put(("error", f"Error reading stderr: {e}", False))
+
+        # Start threads to read stdout and stderr
+        stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+        stdout_thread.start()
+
+        stderr_thread = None
+        if not stderr_to_stdout and process.stderr:
+            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+            stderr_thread.start()
+
+        # Process output from queue in real-time
+        while (
+            stdout_thread.is_alive()
+            or (stderr_thread and stderr_thread.is_alive())
+            or not output_queue.empty()
+        ):
+            try:
+                # Non-blocking get with timeout to check thread status
+                item = output_queue.get(timeout=0.1)
+
+                # Handle different tuple sizes for backward compatibility
+                if len(item) == 3:
+                    stream_type, line, is_progress = item
+                elif len(item) == 2:
+                    stream_type, line = item
+                    is_progress = False
+                else:
+                    continue
+
+                if stream_type == "stdout":
+                    # Check if line matches error regex
+                    is_error = error_pattern and error_pattern.search(line)
+                    if is_error:
+                        output_line = f"  | ERROR: {line}\n"
+                    else:
+                        output_line = f"  | {line}\n"
+
+                    # For progress lines (carriage return), overwrite the same line
+                    if is_progress:
+                        sys.stdout.write(f"\r{output_line.rstrip()}")
+                    else:
+                        sys.stdout.write(output_line)
+                    sys.stdout.flush()
+
+                    if logger:
+                        if is_error:
+                            logger.error(line)
+                        else:
+                            logger.info(line)
+
+                elif stream_type == "stderr":
+                    # stderr output
+                    output_line = f"  | ERROR: {line}\n"
+
+                    # For progress lines (carriage return), overwrite the same line
+                    if is_progress:
+                        sys.stderr.write(f"\r{output_line.rstrip()}")
+                    else:
+                        sys.stderr.write(output_line)
+                    sys.stderr.flush()
+
+                    if logger:
+                        logger.error(line)
+
+                elif stream_type == "error":
+                    # Thread error
+                    sys.stderr.write(f"{line}\n")
+                    sys.stderr.flush()
+                    if logger:
+                        logger.error(line)
+
+            except:
+                # Queue is empty, continue checking thread status
+                pass
+
+        # Wait for threads to complete
+        stdout_thread.join(timeout=1)
+        if stderr_thread:
+            stderr_thread.join(timeout=1)
+
+        # Wait for process to complete
+        return_code = process.wait()
+
+        completion_msg = f"Command completed with return code: {return_code}\n"
+        sys.stdout.write(completion_msg)
+        sys.stdout.flush()
+
+        if logger:
+            logger.info("Return: " + str(return_code))
+
+        return return_code
+
+    except Exception as e:
+        import traceback
+
+        err_formatted = traceback.format_exc()
+        sys.stderr.write(f"Command failed: {err_formatted}\n")
+        sys.stderr.flush()
+        if logger:
+            logger.error(err_formatted)
+        raise
+
+
 def _run_command(
     cmd,
     cwd=None,
@@ -128,6 +381,8 @@ def _run_command(
     stderr_to_stdout=False,
     error_regex=None,
     env=None,
+    stream_output=False,
+    encoding="utf-8",
 ):
     """Modern command execution using subprocess.run with automatic text handling.
 
@@ -136,6 +391,8 @@ def _run_command(
 
     :param stderr_to_stdout: If True, treat stderr as stdout (merge streams)
     :param error_regex: Optional regex pattern to detect error lines (case-insensitive)
+    :param stream_output: If True, stream output in real-time to console (no timeout for long-running commands)
+    :param encoding: Text encoding for output (default: utf-8)
     """
     import re
 
@@ -144,6 +401,12 @@ def _run_command(
         if cwd:
             print(f"  Working directory: {cwd}")
 
+        # If streaming is enabled, use Popen for real-time output
+        if stream_output:
+            return _run_command_streaming(
+                cmd, cwd, logger, shell, stderr_to_stdout, error_regex, env, encoding
+            )
+
         # Use subprocess.run with text=True for automatic text handling
         result = subprocess.run(
             cmd,
@@ -151,7 +414,7 @@ def _run_command(
             cwd=cwd,
             capture_output=True,
             text=True,
-            encoding="utf-8",
+            encoding=encoding,
             errors="replace",
             timeout=timeout,
             env=env,
@@ -250,6 +513,8 @@ def run_command(
     stderr_to_stdout=False,
     error_regex=None,
     env=None,
+    stream_output=False,
+    encoding="utf-8",
 ):
     """Run a command with real-time output.
 
@@ -257,15 +522,26 @@ def run_command(
     :param cwd: Optional current directory
     :param logger: A python logger alike class instance to accept info or error
     :param shell: Whether to use shell
-    :param timeout: Timeout in seconds
+    :param timeout: Timeout in seconds (ignored if stream_output=True)
     :param stderr_to_stdout: If True, treat stderr as stdout (merge streams)
     :param error_regex: Optional regex pattern to detect error lines (case-insensitive)
     :param env: Optional environment variables dictionary
+    :param stream_output: If True, stream output in real-time to console (no timeout for long-running commands)
+    :param encoding: Text encoding for output (default: utf-8)
     :return: Return what the command return
     """
     try:
         return _run_command(
-            cmd, cwd, logger, shell, timeout, stderr_to_stdout, error_regex, env
+            cmd,
+            cwd,
+            logger,
+            shell,
+            timeout,
+            stderr_to_stdout,
+            error_regex,
+            env,
+            stream_output,
+            encoding,
         )
     except Exception as e:
         if logger:

@@ -107,7 +107,7 @@ def ask_yesno(ui_callback, message):
             print("Please enter 'y' or 'n'.")
 
 
-def init_repository(repo_path, bare=True, ui_callback=None):
+def init_repository(repo_path, bare=False, ui_callback=None):
     """
     Initialize a Git repository (bare or non-bare).
 
@@ -199,6 +199,24 @@ def init_git_lfs(repo_path, ui_callback=None):
     result = run_command(init_cmd, cwd=repo_path)
 
     if result == 0:
+        # Configure LFS filter settings
+        filter_configs = [
+            ("filter.lfs.smudge", "git-lfs smudge -- %f"),
+            ("filter.lfs.process", "git-lfs filter-process"),
+            ("filter.lfs.required", "true"),
+            ("filter.lfs.clean", "git-lfs clean -- %f"),
+        ]
+
+        for config_key, config_value in filter_configs:
+            config_cmd = f'git config --local {config_key} "{config_value}"'
+            config_result = run_command(config_cmd, cwd=repo_path)
+            if config_result != 0:
+                hint(
+                    ui_callback,
+                    "warning",
+                    f"Failed to set LFS config {config_key}. LFS may not work correctly.",
+                )
+
         hint(ui_callback, "success", "Git LFS initialized for this repository")
         return True
 
@@ -636,6 +654,17 @@ def configure_branch_fetch(
         f"\n{'='*80}\nConfiguring fetch refspecs for branches: {', '.join(branches)}\n{'='*80}\n",
     )
 
+    # First, verify the remote exists
+    check_remote_cmd = f"git remote get-url {remote_name}"
+    check_result = run_command(check_remote_cmd, cwd=repo_path)
+    if check_result != 0:
+        hint(
+            ui_callback,
+            "error",
+            f"Remote '{remote_name}' does not exist. Cannot configure refspecs.",
+        )
+        return False
+
     success = True
 
     for i, branch in enumerate(branches):
@@ -651,12 +680,20 @@ def configure_branch_fetch(
             action = "Adding"
 
         hint(ui_callback, "info", f"{action} refspec for branch '{branch}': {refspec}")
-        result = run_command(cmd, cwd=repo_path)
+
+        # Capture command output to get error details
+        capture_logger = OutputCaptureLogger(None)
+        result = run_command(cmd, cwd=repo_path, logger=capture_logger)
 
         if result == 0:
             hint(ui_callback, "success", f"Refspec configured for '{branch}'")
         else:
-            hint(ui_callback, "error", f"Failed to configure refspec for '{branch}'")
+            # Get error details from captured output
+            error_output = capture_logger.get_output()
+            error_msg = f"Failed to configure refspec for '{branch}'"
+            if error_output:
+                error_msg += f": {error_output.strip()}"
+            hint(ui_callback, "error", error_msg)
             success = False
 
     return success
@@ -743,7 +780,14 @@ def fetch_from_remote(repo_path, remote_name, ui_callback=None):
         f"\n{'='*80}\nFetching from remote: {remote_name}\n{'='*80}\n",
     )
 
-    result = run_command(f"git fetch {remote_name}", cwd=repo_path)
+    # git fetch can be painfully slow, use streaming output and no timeout
+    # Use --progress to force git to output progress even when stdout/stderr are pipes
+    result = run_command(
+        ["git", "fetch", "--progress", remote_name],
+        cwd=repo_path,
+        stream_output=True,
+        stderr_to_stdout=True,
+    )
 
     if result == 0:
         hint(ui_callback, "success", f"Successfully fetched from '{remote_name}'")
@@ -1095,8 +1139,8 @@ def argument_pars(parser, use_gooey=False):
     parser.add_argument(
         "--bare",
         action="store_true",
-        default=True,
-        help="Create a bare repository (default: True)",
+        default=False,
+        help="Create a bare repository (default: False)",
     )
 
     return parser.parse_args()
@@ -1133,7 +1177,7 @@ def main_core(args, ui_callback=None):
     # Print configuration
     config_msg = (
         f"\n{'='*80}\n"
-        f"Git Bare Repository Initialization\n"
+        f"Git Repository Initialization\n"
         f"{'='*80}\n\n"
         f"Configuration:\n"
         f"  Repository Path: {repo_path}\n"
@@ -1145,7 +1189,7 @@ def main_core(args, ui_callback=None):
             f"  Destination Remote Name: {args.destination_remote_name}\n"
             f"  Destination Remote URL:  {sanitize_remote_url(args.destination_remote_url)}\n"
         )
-    is_bare = getattr(args, "bare", True)
+    is_bare = getattr(args, "bare", False)
     config_msg += (
         f"  Branches:        {', '.join(args.branches)}\n"
         f"  Repository Type: {'Bare' if is_bare else 'Regular (non-bare)'}\n"
@@ -1184,7 +1228,7 @@ def main_core(args, ui_callback=None):
         hint(ui_callback, "success", f"Repository path '{repo_path}' created")
 
     # Step 1: Initialize repository (bare or non-bare)
-    is_bare = getattr(args, "bare", True)  # Default to True for backward compatibility
+    is_bare = getattr(args, "bare", False)  # Default to False
     if not init_repository(repo_path, bare=is_bare, ui_callback=ui_callback):
         hint(ui_callback, "error", "\nFailed to initialize repository")
         return 1

@@ -22,6 +22,7 @@ This tool may be used like this (TeamCity or Jenkins are optional; you may use t
 - **Git** installed and available in your PATH
 - **Git LFS** (optional, but recommended if your repository uses Large File Storage)
 - **Dependencies**: Install required packages with `pip install -r requirements.txt`
+  - Required packages: `Requests>=2.32.5`, `six>=1.16.0`
 
 
 ## Installation
@@ -122,7 +123,8 @@ You can modify these constants in the script:
 8. Filters out graph symbols and sub-commits from merge commits
 9. Splits commits into batches of `BATCH_SIZE`
 10. For each batch:
-    - If LFS is enabled, fetches LFS objects for commits in the batch range
+    - If LFS is enabled, fetches LFS objects for commits in the batch range from origin
+    - Pushes LFS objects to destination FIRST (ensures remote consistency)
     - Pushes the batch from origin to destination remote in chronological order
     - Uses `--force-with-lease` for safe force pushing (if enabled)
     - Fetches from destination to update local references
@@ -330,12 +332,13 @@ A utility script to initialize a bare Git repository and configure it for branch
 
 #### Features
 
-- Creates a bare Git repository
+- Creates a bare or regular Git repository (configurable with `--bare` flag)
 - Configures remote with custom branch fetch specifications
 - Supports multiple branches with explicit refspecs
 - Can be re-run safely (skips existing configurations)
 - Verification mode to check existing configurations
 - Supports destination remote configuration
+- Optionally creates default .gitignore and .gitattributes files for LFS (can be disabled)
 
 #### Usage
 
@@ -345,14 +348,17 @@ python init_git_sync_folder.py --repo-path <path> --remote-url <url> [options]
 
 #### Parameters
 
-- `--repo-path` (required) - Path where the bare repository should be created
+- `--repo-path` (required) - Path where the repository should be created (bare or regular, depending on `--bare` flag)
 - `--remote-url` (required) - URL of the remote repository (e.g., `ssh://git@example.com/repo.git`)
 - `--remote-name` (optional) - Name of the remote (default: `origin`)
 - `--branches` (optional) - List of branches to sync (default: `master`)
 - `--no-fetch` (optional) - Skip the initial fetch operation
 - `--verify-only` (optional) - Only verify existing configuration without making changes
-- `--destination-remote-url` (optional) - URL of the destination remote repository
-- `--destination-remote-name` (optional) - Name of the destination remote (default: `destination`)
+- `--destination-remote-url` or `--dru` (optional) - URL of the destination remote repository
+- `--destination-remote-name` or `--drn` (optional) - Name of the destination remote (default: `destination`)
+- `--no-default-ignore` (optional) - Skip creating default .gitignore file
+- `--no-default-lfs` (optional) - Skip creating default .gitattributes file for LFS
+- `--bare` (optional) - Create a bare repository (default: False, creates a regular repository)
 
 #### Examples
 
@@ -382,14 +388,25 @@ python init_git_sync_folder.py --repo-path /path/to/repo \
 python init_git_sync_folder.py --repo-path /path/to/repo --verify-only
 ```
 
+**Create bare repository with custom options:**
+```bash
+python init_git_sync_folder.py --repo-path /path/to/repo \
+  --remote-url ssh://git@example.com/repo.git \
+  --branches master develop \
+  --bare \
+  --no-default-ignore \
+  --no-default-lfs
+```
+
 #### How It Works
 
-1. Creates a bare Git repository at the specified path
-2. Configures the remote with the provided URL
-3. Sets up branch-specific fetch refspecs for each specified branch
-4. Optionally configures a destination remote
-5. Optionally fetches from the remote to populate the repository
-6. Verifies the configuration and displays available branches
+1. Creates a bare or regular Git repository at the specified path (depending on `--bare` flag)
+2. Optionally creates default .gitignore and .gitattributes files (unless `--no-default-ignore` or `--no-default-lfs` are used)
+3. Configures the remote with the provided URL
+4. Sets up branch-specific fetch refspecs for each specified branch
+5. Optionally configures a destination remote
+6. Optionally fetches from the remote to populate the repository (unless `--no-fetch` is used)
+7. Verifies the configuration and displays available branches
 
 ---
 
@@ -409,7 +426,7 @@ A GUI version of `init_git_sync_folder.py` that provides a graphical interface f
 - Browse for repository path
 - Enter remote URLs and branch names
 - Preview the command that will be executed
-- Checkboxes for optional flags (--no-fetch, --verify-only)
+- Checkboxes for optional flags (--no-fetch, --verify-only, --no-default-ignore, --no-default-lfs, --bare)
 - Destination remote configuration section
 
 #### Usage
@@ -628,7 +645,7 @@ The tools include built-in token sanitization to prevent credential leaks in log
 - Ensure the JSON format matches what `check_remote_change.py` outputs
 
 **Add new branch to sync**
-- Just reinit the the folder; using new params;
+- Reinitialize the folder using new parameters with the additional branch name
 
 ---
 

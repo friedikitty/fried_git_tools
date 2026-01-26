@@ -24,7 +24,7 @@ class Args:
     destination_remote_name: str = "destination"
     no_default_ignore: bool = False
     no_default_lfs: bool = False
-    bare: bool = True
+    bare: bool = False
 
     def __post_init__(self):
         """Set default for branches if None."""
@@ -124,8 +124,8 @@ def build_command_string(args):
     if args.no_default_lfs:
         cmd_parts.append("--no-default-lfs")
 
-    if not args.bare:
-        cmd_parts.append("--no-bare")
+    if args.bare:
+        cmd_parts.append("--bare")
 
     # Destination remote arguments
     if args.destination_remote_url:
@@ -255,7 +255,7 @@ class GitSyncGUI:
             variable=self.no_default_lfs_var,
         ).grid(row=1, column=1, sticky=tk.W, padx=10)
 
-        self.bare_var = tk.BooleanVar(value=True)
+        self.bare_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             checkbox_frame,
             text="Bare repository (--bare)",

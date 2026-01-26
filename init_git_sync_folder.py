@@ -665,10 +665,32 @@ def configure_branch_fetch(
         )
         return False
 
+    # Get existing fetch refspecs to avoid duplicates
+    capture_logger = OutputCaptureLogger(None)
+    result = run_command(
+        f"git config --get-all remote.{remote_name}.fetch",
+        cwd=repo_path,
+        logger=capture_logger,
+    )
+    existing_refspecs = set()
+    if result == 0:
+        output = capture_logger.get_output().strip()
+        if output:
+            existing_refspecs = set(line.strip() for line in output.split("\n") if line.strip())
+
     success = True
 
     for i, branch in enumerate(branches):
         refspec = f"+refs/heads/{branch}:refs/remotes/{remote_name}/{branch}"
+
+        # Check if refspec already exists
+        if refspec in existing_refspecs:
+            hint(
+                ui_callback,
+                "info",
+                f"Refspec for branch '{branch}' already exists, skipping: {refspec}",
+            )
+            continue
 
         if i == 0 and replace_first:
             # First branch: use 'git config' to replace default refspec
@@ -687,6 +709,8 @@ def configure_branch_fetch(
 
         if result == 0:
             hint(ui_callback, "success", f"Refspec configured for '{branch}'")
+            # Add to existing_refspecs to avoid duplicates in the same run
+            existing_refspecs.add(refspec)
         else:
             # Get error details from captured output
             error_output = capture_logger.get_output()

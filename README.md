@@ -37,9 +37,15 @@ This tool may be used like this (TeamCity or Jenkins are optional; you may use t
 
 ### Brief Usage
 
-* Use `init_git_sync_folder_gui.py` to set up an origin->destination sync folder; you may use a token in the URL to avoid authentication problems
-* Use `git_sync_to_remote.py` to test the sync
-* Use TeamCity integration to make the sync process run automatically
+* Use init_git_sync_folder_gui.py to set up origin->destination sync folders; you can use tokens in the URL to bypass authentication issues
+- For the first sync, assuming you're syncing origin/develop to destination/dev
+  - Force reset the current origin to the first commit in develop
+  - Create a dev branch pointing to it
+  - Then force push this branch to the remote branch of the same name
+- Use git_sync_to_remote.py to test the sync
+- Automate the sync process using TeamCity integration
+
+Translated with DeepL.com (free version)
 
 ### git_sync_to_remote.py
 
@@ -615,6 +621,27 @@ The tools include built-in token sanitization to prevent credential leaks in log
 ## Troubleshooting
 
 ### Common Issues
+
+**Error: remote branch already contains content**
+
+
+* Check the contents, then delete them -- **Danger, be careful**
+
+    ```bash
+    # First, checkout another branch; otherwise, the current branch cannot be deleted
+    git checkout xxx
+    
+    # Delete the local branch (if the branch name is head/dev)
+    git branch -d “head/dev”
+    
+    # Force delete
+    git branch -D “head/dev”
+    
+    # If it exists remotely
+    git push origin --delete “head/dev”
+    ```
+
+Translated with DeepL.com (free version)
 
 **Error: Remote 'destination' not found**
 - Make sure you've added the destination remote: `git remote add destination <URL>`
